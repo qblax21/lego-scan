@@ -3,7 +3,8 @@
 // Each scan carries synced:false so step 3 (Google Sheets) can push the queue later.
 
 const $ = id => document.getElementById(id);
-const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache' };
+const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
+  cfg: 'legoscan.cfg', removals: 'legoscan.removals' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -20,10 +21,54 @@ function validBarcode(c) {
 }
 const normBarcode = c => c.padStart(13, '0'); // UPC-A == EAN-13 with leading 0
 
-// Step 2 replaces this with the Apps Script / Brickset call.
-async function lookup(barcode) {
-  return lookupCache[barcode] || null;
+// ---------- optional Google Sheets backend (personal Apps Script) ----------
+// URL + secret are typed in on the phone and kept in localStorage only; nothing private is in the repo.
+let cfg = load(LS.cfg, { url: '', secret: '' });
+let removals = load(LS.removals, []);
+const configured = () => !!(cfg.url && cfg.secret);
+
+async function api(action, payload) {
+  const r = await fetch(cfg.url, { method: 'POST', redirect: 'follow',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // text/plain avoids a CORS preflight
+    body: JSON.stringify({ token: cfg.secret, action, ...payload }) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'request failed');
+  return j;
 }
+
+async function lookup(barcode) {
+  if (lookupCache[barcode]) return lookupCache[barcode];
+  if (!configured() || !navigator.onLine || notFound.has(barcode)) return null;
+  try {
+    const j = await api('lookup', { barcode });
+    if (!j.found) { notFound.add(barcode); return null; } // definitive miss: don't ask again this session
+    const rec = { setNumber: j.setNumber, name: j.name, theme: j.theme, year: j.year };
+    lookupCache[barcode] = rec; save(LS.cache, lookupCache);
+    return rec;
+  } catch { return null; } // network/script error: keep the scan, retry on a later sync
+}
+const notFound = new Set();
+
+let syncing = false;
+async function sync() {
+  if (!configured() || !navigator.onLine || syncing) return;
+  syncing = true;
+  try {
+    for (const s of scans.filter(s => s.status === 'needs' && s.barcode)) { // retry failed lookups
+      const info = await lookup(s.barcode);
+      if (info) Object.assign(s, { setNumber: info.setNumber, name: info.name, theme: info.theme || '', year: info.year || '', status: 'matched', synced: false });
+    }
+    if (removals.length) { await api('remove', { ids: removals }); removals = []; save(LS.removals, removals); }
+    const pending = scans.filter(s => !s.synced);
+    if (pending.length) {
+      await api('upsert', { scans: pending });
+      pending.forEach(s => { s.synced = true; });
+    }
+    save(LS.scans, scans); render();
+  } catch (e) { $('net').textContent = 'Sync failed: ' + e.message; }
+  syncing = false;
+}
+setInterval(sync, 30000);
 
 // ---------- feedback ----------
 let audioCtx;
@@ -42,7 +87,7 @@ const say = t => { $('msg').textContent = t; };
 // ---------- adding scans ----------
 async function addEntry({ barcode = '', setNumber = '' }) {
   let info = null;
-  if (barcode && !setNumber) info = await lookup(barcode);
+  if (barcode && !setNumber) { say('Looking up ' + barcode + '...'); info = await lookup(barcode); }
   if (info) setNumber = info.setNumber;
 
   // duplicate: same set (or same unresolved barcode) in the same destination
@@ -51,18 +96,18 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   if (dup && confirm(`${dup.setNumber || dup.barcode} is already in ${dest} (qty ${dup.qty}). Add 1 to it instead of a new row?`)) {
     dup.qty += 1; dup.synced = false; dup.ts = Date.now();
     scans = scans.filter(s => s !== dup).concat(dup);
-    save(LS.scans, scans); render();
+    save(LS.scans, scans); render(); sync();
     say(`Qty is now ${dup.qty} for ${dup.setNumber || dup.barcode}`);
     return;
   }
 
   scans.push({
     id: Date.now() + Math.random().toString(36).slice(2, 6),
-    barcode, setNumber, name: info?.name || '', year: info?.year || '',
+    barcode, setNumber, name: info?.name || '', theme: info?.theme || '', year: info?.year || '',
     dest, qty: 1, ts: Date.now(), synced: false,
     status: setNumber ? (barcode ? 'matched' : 'saved') : 'needs',
   });
-  save(LS.scans, scans); render();
+  save(LS.scans, scans); render(); sync();
   say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}` : `Saved barcode ${barcode} - needs set number`);
 }
 
@@ -151,7 +196,8 @@ $('undoBtn').onclick = () => {
   const last = [...scans].reverse().find(s => !s.undone);
   if (!last) return;
   scans = scans.filter(s => s !== last);
-  save(LS.scans, scans); render();
+  if (configured()) { removals.push(last.id); save(LS.removals, removals); }
+  save(LS.scans, scans); render(); sync();
   say(`Removed ${last.setNumber || last.barcode}`);
 };
 
@@ -160,7 +206,7 @@ function fixSetNumber(s) {
   if (!v || !/^\d{4,6}$/.test(v.trim())) return;
   s.setNumber = v.trim(); s.status = 'matched'; s.synced = false;
   if (s.barcode) { lookupCache[s.barcode] = { setNumber: s.setNumber, name: s.name, year: s.year }; save(LS.cache, lookupCache); }
-  save(LS.scans, scans); render();
+  save(LS.scans, scans); render(); sync();
 }
 
 function render() {
@@ -182,9 +228,10 @@ function render() {
   });
   $('undoBtn').disabled = !scans.length;
   const pending = scans.filter(s => !s.synced).length;
-  $('net').textContent = `${navigator.onLine ? 'Online' : 'Offline'} - ${scans.length} saved (${pending} not in Sheets)`;
+  $('net').textContent = `${navigator.onLine ? 'Online' : 'Offline'} - ${scans.length} scans` +
+    (configured() ? ` (${pending} waiting to sync)` : ' (Sheets not connected)');
 }
-window.addEventListener('online', render);
+window.addEventListener('online', () => { render(); sync(); });
 window.addEventListener('offline', render);
 
 $('csvBtn').onclick = () => {
@@ -196,5 +243,14 @@ $('csvBtn').onclick = () => {
   a.download = 'lego-scans.csv'; a.click();
 };
 
-setDest(dest); render();
+$('cfgBtn').onclick = () => {
+  const url = prompt('Apps Script web app URL (leave blank to disconnect):', cfg.url);
+  if (url === null) return;
+  const secret = url ? prompt('Secret token:', cfg.secret) : '';
+  if (secret === null) return;
+  cfg = { url: url.trim(), secret: (secret || '').trim() };
+  save(LS.cfg, cfg); render(); sync();
+};
+
+setDest(dest); render(); sync();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

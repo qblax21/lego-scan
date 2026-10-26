@@ -21,6 +21,17 @@ Deploy to GitHub Pages (free, HTTPS):
 5. After about a minute your app is at `https://<username>.github.io/lego-scan/`.
 6. Open it in Safari -> Share -> Add to Home Screen.
 
+## Google Sheets + barcode lookup (optional, personal)
+The scanner works without this. To connect your own sheet:
+1. Open your sheet -> Extensions -> Apps Script. Replace the code with `apps-script/Code.gs`.
+2. Project Settings (gear) -> Script properties -> add `SECRET` (a long random string you make up)
+   and `BRICKSET_KEY` (your free key from brickset.com). These are never in the code or repo.
+3. Deploy -> New deployment -> type "Web app" -> Execute as: Me -> Who has access: Anyone -> Deploy.
+   Authorize when asked, then copy the web app URL.
+4. In the app tap "Sheets", paste the URL, then the secret. Both stay on your phone only.
+New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".
+Brickset allows about 100 lookups per day per key; cached barcodes cost nothing.
+
 ## License
 MIT, Copyright (c) 2026 Quinn Brownell. See `LICENSE`.
 Bundles [@zxing/library](https://github.com/zxing-js/library) 0.21.3 (MIT) in `vendor/zxing.min.js`.
