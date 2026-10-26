@@ -4,7 +4,7 @@
 
 const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
-  cfg: 'legoscan.cfg', removals: 'legoscan.removals' };
+  cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -104,7 +104,7 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   if (info) setNumber = info.setNumber;
 
   // duplicate: same set (or same unresolved barcode) in the same destination
-  const dup = scans.find(s => s.dest === dest && !s.undone &&
+  const dup = scans.find(s => s.dest === dest && s.condition === $('cond').value && !s.undone &&
     ((setNumber && s.setNumber === setNumber) || (!setNumber && barcode && s.barcode === barcode && !s.setNumber)));
   if (dup && await ask(`${dup.setNumber || dup.barcode} is already in ${dest} (qty ${dup.qty}). Add 1 to it, or make a new row?`)) {
     dup.qty += 1; dup.synced = false; dup.ts = Date.now();
@@ -117,7 +117,7 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   scans.push({
     id: Date.now() + Math.random().toString(36).slice(2, 6),
     barcode, setNumber, name: info?.name || '', theme: info?.theme || '', year: info?.year || '',
-    dest, qty: 1, ts: Date.now(), synced: false,
+    dest, condition: $('cond').value, qty: 1, ts: Date.now(), synced: false,
     status: setNumber ? (barcode ? 'matched' : 'saved') : 'needs',
   });
   save(LS.scans, scans); render(); sync();
@@ -193,8 +193,18 @@ async function startCamera() {
 $('startBtn').onclick = startCamera;
 
 // ---------- UI ----------
+// Condition words match the existing sheet tabs: Personal uses Sealed/Built, Sale uses New/Used.
+const CONDS = { Personal: ['Sealed', 'Built', 'Used'], Sale: ['New', 'Used'] };
+let condChoice = load(LS.cond, {}); // remembered per destination
+function fillConds() {
+  const sel = $('cond'); sel.textContent = '';
+  CONDS[dest].forEach(c => { const o = document.createElement('option'); o.textContent = c; sel.append(o); });
+  sel.value = CONDS[dest].includes(condChoice[dest]) ? condChoice[dest] : CONDS[dest][0];
+}
+$('cond').onchange = () => { condChoice[dest] = $('cond').value; save(LS.cond, condChoice); };
+
 function setDest(d) {
-  dest = d; save(LS.dest, d);
+  dest = d; save(LS.dest, d); fillConds();
   $('destPersonal').classList.toggle('on', d === 'Personal');
   $('destSale').classList.toggle('on', d === 'Sale');
 }
