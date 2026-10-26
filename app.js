@@ -71,6 +71,18 @@ async function sync() {
 }
 setInterval(sync, 30000);
 
+// ---------- in-page dialog (native confirm/prompt pause the camera feed on iOS) ----------
+function ask(text) {
+  return new Promise(res => {
+    $('dlgText').textContent = text; $('dlg').hidden = false;
+    const done = v => { $('dlg').hidden = true; $('dlgYes').onclick = $('dlgNo').onclick = null; res(v); };
+    $('dlgYes').onclick = () => done(true);
+    $('dlgNo').onclick = () => done(false);
+  });
+}
+const resumeCam = () => { if (video.srcObject && video.paused) video.play().catch(() => {}); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeCam(); });
+
 // ---------- feedback ----------
 let audioCtx;
 function beep() {
@@ -94,7 +106,7 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   // duplicate: same set (or same unresolved barcode) in the same destination
   const dup = scans.find(s => s.dest === dest && !s.undone &&
     ((setNumber && s.setNumber === setNumber) || (!setNumber && barcode && s.barcode === barcode && !s.setNumber)));
-  if (dup && confirm(`${dup.setNumber || dup.barcode} is already in ${dest} (qty ${dup.qty}). Add 1 to it instead of a new row?`)) {
+  if (dup && await ask(`${dup.setNumber || dup.barcode} is already in ${dest} (qty ${dup.qty}). Add 1 to it, or make a new row?`)) {
     dup.qty += 1; dup.synced = false; dup.ts = Date.now();
     scans = scans.filter(s => s !== dup).concat(dup);
     save(LS.scans, scans); render(); sync();
@@ -129,7 +141,7 @@ function onCode(raw) {
 }
 
 async function tick() {
-  if (!video.videoWidth || busy) return;
+  if (!video.videoWidth || busy || !$('dlg').hidden) return;
   busy = true;
   try {
     if (detector) {
@@ -150,8 +162,16 @@ async function startCamera() {
   $('startBtn').hidden = true;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     video.srcObject = stream; await video.play();
+    // Best-effort focus help; iOS Safari may ignore any of these.
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const adv = {};
+    if (caps.focusMode && caps.focusMode.includes('continuous')) adv.focusMode = 'continuous';
+    // Zoom lets you hold the phone farther back, where the lens can focus.
+    if (caps.zoom) adv.zoom = Math.min(caps.zoom.max, Math.max(caps.zoom.min, 2));
+    if (Object.keys(adv).length) track.applyConstraints({ advanced: [adv] }).catch(() => {});
   } catch (e) {
     $('startBtn').hidden = false;
     say(location.protocol === 'http:' && location.hostname !== 'localhost'
@@ -205,6 +225,7 @@ $('undoBtn').onclick = () => {
 
 function fixSetNumber(s) {
   const v = prompt(`Set number for barcode ${s.barcode}?`, '');
+  resumeCam();
   if (!v || !/^\d{4,6}$/.test(v.trim())) return;
   s.setNumber = v.trim(); s.status = 'matched'; s.synced = false;
   if (s.barcode) { lookupCache[s.barcode] = { setNumber: s.setNumber, name: s.name, year: s.year }; save(LS.cache, lookupCache); }
@@ -247,8 +268,9 @@ $('csvBtn').onclick = () => {
 
 $('cfgBtn').onclick = () => {
   const url = prompt('Apps Script web app URL (leave blank to disconnect):', cfg.url);
-  if (url === null) return;
+  if (url === null) { resumeCam(); return; }
   const secret = url ? prompt('Secret token:', cfg.secret) : '';
+  resumeCam();
   if (secret === null) return;
   cfg = { url: url.trim(), secret: (secret || '').trim() };
   save(LS.cfg, cfg); render(); sync();

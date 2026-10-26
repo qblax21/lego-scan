@@ -25,4 +25,8 @@ h2{font-size:16px;margin:0;color:var(--mut);font-weight:600}
 .list .t{font-weight:600}.list .s{font-size:13px;color:var(--mut);word-break:break-all}
 .badge{font-size:12px;border-radius:99px;padding:3px 10px;white-space:nowrap;background:#333}
 .badge.matched,.badge.saved{background:var(--ok)}.badge.needs{background:var(--warn);color:#000}
+.dlg{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:24px;z-index:10}
+.dlg[hidden]{display:none}
+.dlg .box{background:var(--card);border-radius:16px;padding:20px;width:100%;max-width:360px;display:grid;gap:10px}
+.dlg p{margin:0 0 6px;font-size:17px}
 .foot{display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:14px}
