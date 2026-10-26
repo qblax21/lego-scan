@@ -24,7 +24,7 @@ function doPost(e) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    if (req.action === 'lookup') return out(lookup(String(req.barcode || ''), props.getProperty('BRICKSET_KEY')));
+    if (req.action === 'lookup') return out(lookup(String(req.barcode || ''), (props.getProperty('BRICKSET_KEY') || '').trim()));
     if (req.action === 'upsert') return out(upsert(req.scans || []));
     if (req.action === 'remove') return out(remove(req.ids || []));
     return out({ ok: false, error: 'unknown action' });
@@ -78,12 +78,18 @@ function lookup(barcode, key) {
 }
 
 function bricksetQuery(q, key) {
+  // Built by hand: Brickset 500s if userHash is missing, and an object payload drops empty values.
+  const body = 'apiKey=' + encodeURIComponent(key) + '&userHash=' +
+    '&params=' + encodeURIComponent(JSON.stringify({ query: q, pageSize: 5 }));
   const res = UrlFetchApp.fetch('https://brickset.com/api/v3.asmx/getSets', {
     method: 'post',
-    payload: { apiKey: key, userHash: '', params: JSON.stringify({ query: q, pageSize: 5 }) },
+    contentType: 'application/x-www-form-urlencoded',
+    payload: body,
     muteHttpExceptions: true,
   });
-  const j = JSON.parse(res.getContentText());
+  const text = res.getContentText();
+  let j;
+  try { j = JSON.parse(text); } catch (e) { throw new Error('Brickset HTTP ' + res.getResponseCode() + ': ' + text.slice(0, 120)); }
   if (j.status !== 'success') throw new Error('Brickset: ' + (j.message || j.status));
   // Only accept a set whose stored barcode really equals the query, so a text match can't mislabel a scan.
   const hit = (j.sets || []).find(s => s.barcode && (s.barcode.EAN === q || s.barcode.UPC === q));
