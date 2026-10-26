@@ -4,7 +4,7 @@
 
 const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
-  cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond' };
+  cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -117,9 +117,10 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   scans.push({
     id: Date.now() + Math.random().toString(36).slice(2, 6),
     barcode, setNumber, name: info?.name || '', theme: info?.theme || '', year: info?.year || '',
-    dest, condition: $('cond').value, qty: 1, ts: Date.now(), synced: false,
+    dest, condition: $('cond').value, extra: getExtra(), qty: 1, ts: Date.now(), synced: false,
     status: setNumber ? (barcode ? 'matched' : 'saved') : 'needs',
   });
+  clearOneOffFields();
   save(LS.scans, scans); render(); sync();
   say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}`
     : `Saved barcode ${barcode} - needs set number` + (lookupError ? ` (lookup error: ${lookupError})` : configured() && navigator.onLine ? ' (not found in Brickset)' : ''));
@@ -205,8 +206,65 @@ function fillConds() {
 }
 $('cond').onchange = () => { condChoice[dest] = $('cond').value; save(LS.cond, condChoice); };
 
+// Optional per-copy details. Anything Brickset can tell us (name, theme, year, category) is NOT here.
+// `keep` fields remember the last value so a batch of similar items needs no retyping.
+const MONEY = { type: 'text', mode: 'decimal' };
+const FIELDS = {
+  Personal: [
+    { key: 'boughtFor', label: 'Bought For', ...MONEY },
+    { key: 'purchaseDate', label: 'Purchase Date', type: 'date' },
+    { key: 'location', label: 'Location', type: 'text', keep: true },
+    { key: 'estValue', label: 'Est. Current Value', ...MONEY },
+    { key: 'notes', label: 'Notes', type: 'text' },
+  ],
+  Sale: [
+    { key: 'boughtFor', label: 'Bought For', ...MONEY },
+    { key: 'purchaseDate', label: 'Purchase Date', type: 'date' },
+    { key: 'boxCond', label: 'Box Cond.', type: 'select', options: ['Mint', 'Good', 'Fair', 'Poor'], keep: true },
+    { key: 'complete', label: 'Complete?', type: 'select', options: ['Yes', 'No'], keep: true },
+    { key: 'estSalePrice', label: 'Est. Sale Price', ...MONEY },
+    { key: 'shipping', label: 'Shipping', ...MONEY },
+    { key: 'prepCost', label: 'Prep Cost', ...MONEY },
+    { key: 'listingStatus', label: 'Status', type: 'select', options: ['Hold', 'Listed'], keep: true, dflt: 'Hold' },
+    { key: 'notes', label: 'Notes', type: 'text' },
+  ],
+};
+const kept = load(LS.kept, {}); // `${dest}.${key}` -> last value
+
+function renderFields() {
+  const box = $('fields'); box.textContent = '';
+  FIELDS[dest].forEach(f => {
+    const label = document.createElement('label'); label.textContent = f.label;
+    let el;
+    if (f.type === 'select') {
+      el = document.createElement('select');
+      ['', ...f.options].forEach(o => { const op = document.createElement('option'); op.value = o; op.textContent = o || '-'; el.append(op); });
+    } else {
+      el = document.createElement('input'); el.type = f.type;
+      if (f.mode) el.inputMode = f.mode;
+    }
+    el.id = 'f_' + f.key;
+    const saved = kept[dest + '.' + f.key];
+    el.value = f.keep ? (saved ?? f.dflt ?? '') : '';
+    label.append(el); box.append(label);
+  });
+}
+function getExtra() {
+  const x = {};
+  FIELDS[dest].forEach(f => {
+    const v = $('f_' + f.key).value.trim();
+    if (v) x[f.key] = v;
+    if (f.keep) kept[dest + '.' + f.key] = v;
+  });
+  save(LS.kept, kept);
+  return x;
+}
+function clearOneOffFields() { // fields that aren't remembered start empty for the next item
+  FIELDS[dest].filter(f => !f.keep).forEach(f => { $('f_' + f.key).value = ''; });
+}
+
 function setDest(d) {
-  dest = d; save(LS.dest, d); fillConds();
+  dest = d; save(LS.dest, d); fillConds(); renderFields();
   $('destPersonal').classList.toggle('on', d === 'Personal');
   $('destSale').classList.toggle('on', d === 'Sale');
 }
@@ -270,9 +328,12 @@ window.addEventListener('online', () => { render(); sync(); });
 window.addEventListener('offline', render);
 
 $('csvBtn').onclick = () => {
-  const cols = ['setNumber', 'name', 'year', 'barcode', 'dest', 'qty', 'status', 'ts'];
+  const extraKeys = [...new Set(Object.values(FIELDS).flat().map(f => f.key))];
+  const cols = ['setNumber', 'name', 'theme', 'year', 'barcode', 'dest', 'condition', 'qty', 'status', 'ts'];
   const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [cols.join(',')].concat(scans.map(s => cols.map(c => esc(c === 'ts' ? new Date(s.ts).toISOString() : s[c])).join(',')));
+  const val = (s, c) => c === 'ts' ? new Date(s.ts).toISOString() : extraKeys.includes(c) ? s.extra?.[c] : s[c];
+  const all = cols.concat(extraKeys);
+  const rows = [all.join(',')].concat(scans.map(s => all.map(c => esc(val(s, c))).join(',')));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
   a.download = 'lego-scans.csv'; a.click();

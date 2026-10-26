@@ -12,7 +12,13 @@
  */
 const STAGING = 'Scan Staging';
 const CACHE = 'Lookup Cache';
-const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID'];
+const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID',
+  'Bought For', 'Purchase Date', 'Location', 'Est. Value', 'Box Cond.', 'Complete?', 'Est. Sale Price', 'Shipping', 'Prep Cost',
+  'Listing Status', 'Notes'];
+// App field key -> staging column header
+const EXTRA = { boughtFor: 'Bought For', purchaseDate: 'Purchase Date', location: 'Location', estValue: 'Est. Value',
+  boxCond: 'Box Cond.', complete: 'Complete?', estSalePrice: 'Est. Sale Price', shipping: 'Shipping', prepCost: 'Prep Cost',
+  listingStatus: 'Listing Status', notes: 'Notes' };
 
 function doPost(e) {
   const props = PropertiesService.getScriptProperties();
@@ -99,13 +105,20 @@ function bricksetQuery(q, key) {
 // ---------- staging rows ----------
 function upsert(scans) {
   const sh = sheet(STAGING, COLS);
+  if (sh.getMaxColumns() < COLS.length) sh.insertColumnsAfter(sh.getMaxColumns(), COLS.length - sh.getMaxColumns());
+  sh.getRange(1, 1, 1, COLS.length).setValues([COLS]); // keep headers in sync with this script
   const idCol = COLS.indexOf('Scan ID') + 1;
   const last = sh.getLastRow();
   const ids = last > 1 ? sh.getRange(2, idCol, last - 1, 1).getDisplayValues().map(r => r[0]) : [];
   let n = 0;
   scans.forEach(s => {
-    const row = [new Date(s.ts), s.dest, s.setNumber || '', s.name || '', s.theme || '', s.year || '',
-      s.qty, s.condition || '', s.barcode || '', s.status === 'needs' ? 'Needs set number' : 'OK', s.id];
+    const x = s.extra || {};
+    const extraCols = Object.keys(EXTRA).reduce((o, k) => { o[EXTRA[k]] = x[k] || ''; return o; }, {});
+    const base = { 'Timestamp': new Date(s.ts), 'Destination': s.dest, 'Set #': s.setNumber || '', 'Set Name': s.name || '',
+      'Theme': s.theme || '', 'Year': s.year || '', 'Qty': s.qty, 'Condition': s.condition || '', 'Barcode': s.barcode || '',
+      'Status': s.status === 'needs' ? 'Needs set number' : 'OK', 'Scan ID': s.id };
+    const vals = Object.assign({}, extraCols, base);
+    const row = COLS.map(c => vals[c]);
     const i = ids.indexOf(s.id);
     const r = i >= 0 ? i + 2 : sh.getLastRow() + 1;
     if (i < 0) ids.push(s.id);
