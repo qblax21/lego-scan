@@ -193,8 +193,10 @@ async function startCamera() {
 $('startBtn').onclick = startCamera;
 
 // ---------- UI ----------
-// Condition words match the existing sheet tabs: Personal uses Sealed/Built, Sale uses New/Used.
-const CONDS = { Personal: ['Sealed', 'Built', 'Used'], Sale: ['New', 'Used'] };
+const CONDS = {
+  Personal: ['Sealed', 'Open box', 'Used', 'Damaged', 'Missing pieces', 'Built'],
+  Sale: ['New', 'Used', 'Damaged'],
+};
 let condChoice = load(LS.cond, {}); // remembered per destination
 function fillConds() {
   const sel = $('cond'); sel.textContent = '';
