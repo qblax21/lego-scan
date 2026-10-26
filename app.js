@@ -45,8 +45,9 @@ async function lookup(barcode) {
     const rec = { setNumber: j.setNumber, name: j.name, theme: j.theme, year: j.year };
     lookupCache[barcode] = rec; save(LS.cache, lookupCache);
     return rec;
-  } catch { return null; } // network/script error: keep the scan, retry on a later sync
+  } catch (e) { lookupError = e.message; return null; } // network/script error: keep the scan, retry on a later sync
 }
+let lookupError = '';
 const notFound = new Set();
 
 let syncing = false;
@@ -87,7 +88,7 @@ const say = t => { $('msg').textContent = t; };
 // ---------- adding scans ----------
 async function addEntry({ barcode = '', setNumber = '' }) {
   let info = null;
-  if (barcode && !setNumber) { say('Looking up ' + barcode + '...'); info = await lookup(barcode); }
+  if (barcode && !setNumber) { say('Looking up ' + barcode + '...'); lookupError = ''; info = await lookup(barcode); }
   if (info) setNumber = info.setNumber;
 
   // duplicate: same set (or same unresolved barcode) in the same destination
@@ -108,7 +109,8 @@ async function addEntry({ barcode = '', setNumber = '' }) {
     status: setNumber ? (barcode ? 'matched' : 'saved') : 'needs',
   });
   save(LS.scans, scans); render(); sync();
-  say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}` : `Saved barcode ${barcode} - needs set number`);
+  say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}`
+    : `Saved barcode ${barcode} - needs set number` + (lookupError ? ` (lookup error: ${lookupError})` : configured() && navigator.onLine ? ' (not found in Brickset)' : ''));
 }
 
 // ---------- scanning ----------
