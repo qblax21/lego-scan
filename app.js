@@ -195,7 +195,7 @@ $('startBtn').onclick = startCamera;
 
 // ---------- UI ----------
 const CONDS = {
-  Personal: ['Sealed', 'Open box', 'Used', 'Damaged', 'Missing pieces', 'Built'],
+  Personal: ['Sealed', 'Open Box', 'Used', 'Damaged', 'Missing Pieces', 'Built'],
   Sale: ['New', 'Used', 'Damaged'],
 };
 let condChoice = load(LS.cond, {}); // remembered per destination
@@ -220,12 +220,12 @@ const FIELDS = {
   Sale: [
     { key: 'boughtFor', label: 'Bought For', ...MONEY },
     { key: 'purchaseDate', label: 'Purchase Date', type: 'date' },
-    { key: 'boxCond', label: 'Box Cond.', type: 'select', options: ['Mint', 'Good', 'Fair', 'Poor'], keep: true },
-    { key: 'complete', label: 'Complete?', type: 'select', options: ['Yes', 'No'], keep: true },
+    { key: 'boxCond', label: 'Box Cond.', type: 'select', options: ['Mint', 'Great', 'Good', 'Fair', 'Poor'], keep: true },
+    { key: 'complete', label: 'Complete?', type: 'select', options: ['Yes', 'No', 'Unknown'], keep: true },
     { key: 'estSalePrice', label: 'Est. Sale Price', ...MONEY },
     { key: 'shipping', label: 'Shipping', ...MONEY },
     { key: 'prepCost', label: 'Prep Cost', ...MONEY },
-    { key: 'listingStatus', label: 'Status', type: 'select', options: ['Hold', 'Listed'], keep: true, dflt: 'Hold' },
+    { key: 'listingStatus', label: 'Status', type: 'select', options: ['Hold', 'Listed', 'Offer'], keep: true, dflt: 'Hold' },
     { key: 'notes', label: 'Notes', type: 'text' },
   ],
 };

@@ -7,7 +7,8 @@ class H(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("", 8080), H) as s:
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer.daemon_threads = True
+with socketserver.ThreadingTCPServer(("", 8080), H) as s:
     print("Serving on http://localhost:8080")
     s.serve_forever()

@@ -32,6 +32,13 @@ The scanner works without this. To connect your own sheet:
 New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".
 Brickset allows about 100 lookups per day per key; cached barcodes cost nothing.
 
+### Moving staged rows into your inventory
+Reload the sheet after updating the script; a **LEGO Scan** menu appears. In `Scan Staging`, select the rows
+to move, then **LEGO Scan -> Move selected staging rows to inventory**. Rows go to the Personal or Sale tab
+that matches their Destination, with only the columns that tab already has. Sale formulas (Strike Price,
+Profit, ROI %) and the Fee % / Target Profit defaults are copied from the row above. Moved rows stay in staging
+marked "Moved to ..."; rows still needing a set number are skipped.
+
 ## License
 MIT, Copyright (c) 2026 Quinn Brownell. See `LICENSE`.
 Bundles [@zxing/library](https://github.com/zxing-js/library) 0.21.3 (MIT) in `vendor/zxing.min.js`.
