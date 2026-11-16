@@ -214,7 +214,6 @@ const FIELDS = {
     { key: 'boughtFor', label: 'Bought For', ...MONEY },
     { key: 'purchaseDate', label: 'Purchase Date', type: 'date' },
     { key: 'location', label: 'Location', type: 'text', keep: true },
-    { key: 'estValue', label: 'Est. Current Value', ...MONEY },
     { key: 'notes', label: 'Notes', type: 'text' },
   ],
   Sale: [
@@ -222,7 +221,6 @@ const FIELDS = {
     { key: 'purchaseDate', label: 'Purchase Date', type: 'date' },
     { key: 'boxCond', label: 'Box Cond.', type: 'select', options: ['Mint', 'Great', 'Good', 'Fair', 'Poor'], keep: true },
     { key: 'complete', label: 'Complete?', type: 'select', options: ['Yes', 'No', 'Unknown'], keep: true },
-    { key: 'estSalePrice', label: 'Est. Sale Price', ...MONEY },
     { key: 'shipping', label: 'Shipping', ...MONEY },
     { key: 'prepCost', label: 'Prep Cost', ...MONEY },
     { key: 'listingStatus', label: 'Status', type: 'select', options: ['Hold', 'Listed', 'Offer'], keep: true, dflt: 'Hold' },

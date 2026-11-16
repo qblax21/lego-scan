@@ -13,11 +13,11 @@
 const STAGING = 'Scan Staging';
 const CACHE = 'Lookup Cache';
 const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID',
-  'Bought For', 'Purchase Date', 'Location', 'Est. Value', 'Box Cond.', 'Complete?', 'Est. Sale Price', 'Shipping', 'Prep Cost',
+  'Bought For', 'Purchase Date', 'Location', 'Box Cond.', 'Complete?', 'Shipping', 'Prep Cost',
   'Listing Status', 'Notes'];
-// App field key -> staging column header
-const EXTRA = { boughtFor: 'Bought For', purchaseDate: 'Purchase Date', location: 'Location', estValue: 'Est. Value',
-  boxCond: 'Box Cond.', complete: 'Complete?', estSalePrice: 'Est. Sale Price', shipping: 'Shipping', prepCost: 'Prep Cost',
+// App field key -> staging column header (values come from the sheet's "Update values" menu, not the app)
+const EXTRA = { boughtFor: 'Bought For', purchaseDate: 'Purchase Date', location: 'Location',
+  boxCond: 'Box Cond.', complete: 'Complete?', shipping: 'Shipping', prepCost: 'Prep Cost',
   listingStatus: 'Listing Status', notes: 'Notes' };
 
 function doPost(e) {
@@ -158,14 +158,14 @@ const TARGETS = {
   Personal: {
     tab: 'Personal Inventory', key: 'Set #', formulas: [], defaults: [],
     map: { 'Item': 'Set Name', 'Category': '@theme', 'Set #': 'Set #', 'Qty': 'Qty', 'Condition': 'Condition',
-      'Bought For': 'Bought For', 'Purchase Date': 'Purchase Date', 'Estimated Current Value': 'Est. Value',
+      'Bought For': 'Bought For', 'Purchase Date': 'Purchase Date',
       'Location': 'Location', 'Notes': 'Notes' },
   },
   Sale: {
     tab: 'Sale Inventory', key: 'Set #', formulas: ['Strike Price', 'Profit', 'ROI %'], defaults: ['Fee %', 'Target Profit'],
     map: { 'Set #': 'Set #', 'Set Name': 'Set Name', 'Theme': '@theme', 'Qty': 'Qty', 'Condition': 'Condition',
       'Box Cond.': 'Box Cond.', 'Complete?': 'Complete?', 'Bought For': 'Bought For', 'Purchase Date': 'Purchase Date',
-      'Est. Sale Price': 'Est. Sale Price', 'Shipping': 'Shipping', 'Prep Cost': 'Prep Cost',
+      'Shipping': 'Shipping', 'Prep Cost': 'Prep Cost',
       'Status': 'Listing Status', 'Notes': 'Notes' },
   },
 };
@@ -176,7 +176,110 @@ const THEME_ALIAS = { 'marvel super heroes': 'Marvel', 'the lord of the rings': 
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('LEGO Scan')
     .addItem('Move selected staging rows to inventory', 'moveSelected')
+    .addItem('Update values for selected rows (Brickset)', 'updateValues')
     .addToUi();
+}
+
+// ---------- market values from the Brickset set page ----------
+// Brickset's API has no market value, but each set page shows "Current value" (New / Used, from BrickLink) for
+// retired sets and only the RRP for sets still in production. Rule: sealed/new -> New value, anything else -> Used
+// value, and if the page has no current value (not retired) -> the US retail price (RRP).
+const VALUE_TABS = {
+  'Personal Inventory': { set: 'Set #', cond: 'Condition', qty: 'Qty', unit: 'Value of One', total: 'Estimated Current Value' },
+  'Sale Inventory': { set: 'Set #', cond: 'Condition', price: 'Est. Sale Price' },
+};
+
+function parseBricksetValues(html) {
+  const money = s => { const m = /\$\s*([\d,]+(?:\.\d+)?)/.exec(s || ''); return m ? parseFloat(m[1].replace(/,/g, '')) : null; };
+  const cv = /<dt>\s*Current value\s*<\/dt>\s*<dd>([\s\S]*?)<\/dd>/i.exec(html);
+  const nw = cv ? /New:([\s\S]*?)(?:<br|$)/i.exec(cv[1]) : null;
+  const us = cv ? /Used:([\s\S]*)$/i.exec(cv[1]) : null;
+  const rrp = /<dt>\s*RRP\s*<\/dt>\s*<dd>([\s\S]*?)<\/dd>/i.exec(html);
+  return { newValue: nw ? money(nw[1]) : null, usedValue: us ? money(us[1]) : null, rrp: rrp ? money(rrp[1]) : null };
+}
+
+function bricksetPage(setNum) {
+  const n = /-\d+$/.test(setNum) ? setNum : setNum + '-1';
+  const res = UrlFetchApp.fetch('https://brickset.com/sets/' + encodeURIComponent(n), {
+    muteHttpExceptions: true, followRedirects: true,
+    headers: { 'User-Agent': 'Mozilla/5.0 (personal LEGO inventory sheet)' },
+  });
+  if (res.getResponseCode() !== 200) return null;
+  const html = res.getContentText();
+  if (/Page not found/i.test(html) && !/<dt>\s*Number\s*<\/dt>/i.test(html)) return null;
+  return parseBricksetValues(html);
+}
+
+function pickValue(v, condition) {
+  const isNew = /^(sealed|new)$/i.test(String(condition).trim());
+  const want = isNew ? v.newValue : v.usedValue;
+  if (want != null) return { price: want, source: isNew ? 'new value' : 'used value' };
+  if (v.rrp != null) return { price: v.rrp, source: 'retail (no market value listed)' };
+  return null;
+}
+
+function updateValues() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getActiveSheet();
+  const t = VALUE_TABS[sh.getName()];
+  if (!t) { ui.alert('Open "Personal Inventory" or "Sale Inventory" and select the rows to update first.'); return; }
+
+  const list = ss.getActiveRangeList();
+  const ranges = list ? list.getRanges() : [ss.getActiveRange()];
+  const rowNums = {};
+  ranges.forEach(r => { for (let i = r.getRow(); i < r.getRow() + r.getNumRows(); i++) if (i >= 2) rowNums[i] = true; });
+  const rows = Object.keys(rowNums).map(Number).sort((a, b) => a - b);
+  if (!rows.length) { ui.alert('Select the rows to update (not the header) first.'); return; }
+  if (rows.length > 120) { ui.alert('That is ' + rows.length + ' rows. Please select 120 or fewer at a time.'); return; }
+
+  const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const col = name => head.indexOf(name) + 1;
+  const setCol = col(t.set), condCol = col(t.cond);
+  const target = t.price ? col(t.price) : col(t.unit) || col(t.total);
+  if (!setCol || !condCol || !target) { ui.alert('Could not find the expected columns on this tab.'); return; }
+
+  const todo = [], skipped = [];
+  rows.forEach(r => {
+    const setNum = String(sh.getRange(r, setCol).getDisplayValue()).trim();
+    const cond = String(sh.getRange(r, condCol).getDisplayValue()).trim();
+    if (!setNum) skipped.push('row ' + r + ': no set number');
+    else if (!cond) skipped.push('row ' + r + ' (' + setNum + '): no condition');
+    else todo.push({ r: r, setNum: setNum, cond: cond });
+  });
+  if (!todo.length) { ui.alert('Nothing to update.\n\n' + skipped.join('\n')); return; }
+
+  const what = t.price ? '"' + t.price + '"' : '"' + (t.unit || t.total) + '"' + (t.unit && t.total ? ' and "' + t.total + '"' : '');
+  const ask = 'Look up ' + todo.length + ' row(s) on Brickset and overwrite ' + what + '?' +
+    '\nSealed/New use the New value; everything else uses the Used value; sets without a market value use retail.' +
+    (skipped.length ? '\n\nSkipping:\n' + skipped.join('\n') : '');
+  if (ui.alert('Update values', ask, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+  const cache = {}, notes = [];
+  let done = 0;
+  todo.forEach(o => {
+    if (!(o.setNum in cache)) {
+      try { cache[o.setNum] = bricksetPage(o.setNum); } catch (e) { cache[o.setNum] = null; }
+      Utilities.sleep(500); // be gentle with Brickset
+    }
+    const v = cache[o.setNum];
+    const pick = v ? pickValue(v, o.cond) : null;
+    if (!pick) { notes.push('row ' + o.r + ' (' + o.setNum + '): no price found, left unchanged'); return; }
+    if (t.price) {
+      sh.getRange(o.r, target).setValue(pick.price);
+    } else if (t.unit && t.total && col(t.qty)) {
+      sh.getRange(o.r, col(t.unit)).setValue(pick.price); // Value of One
+      const u = sh.getRange(o.r, col(t.unit)).getA1Notation(), q = sh.getRange(o.r, col(t.qty)).getA1Notation();
+      sh.getRange(o.r, col(t.total)).setFormula('=' + u + '*' + q); // Est. Current Value = value x qty
+    } else {
+      const qty = Number(sh.getRange(o.r, col(t.qty)).getValue()) || 1;
+      sh.getRange(o.r, target).setValue(pick.price * qty);
+    }
+    notes.push('row ' + o.r + ' (' + o.setNum + ', ' + o.cond + '): $' + pick.price + ' - ' + pick.source);
+    done++;
+  });
+  ui.alert('Updated ' + done + ' of ' + todo.length + ' row(s).\n\n' + notes.slice(0, 25).join('\n') +
+    (notes.length > 25 ? '\n...and ' + (notes.length - 25) + ' more' : ''));
 }
 
 function listFor(sh, row, col) { // allowed dropdown values for a column, read from an existing row

@@ -39,6 +39,13 @@ that matches their Destination, with only the columns that tab already has. Sale
 Profit, ROI %) and the Fee % / Target Profit defaults are copied from the row above. Moved rows stay in staging
 marked "Moved to ..."; rows still needing a set number are skipped.
 
+### Market values (Update values menu)
+Open Personal Inventory or Sale Inventory, select rows, then **LEGO Scan -> Update values for selected rows (Brickset)**.
+It reads each set's Brickset page (Brickset's API has no market value). Sealed/New use the "New" Current value,
+everything else the "Used" value; sets with no market value (not retired) use the US retail price.
+Personal gets Value of One plus Est. Current Value (= Value of One x Qty); Sale gets Est. Sale Price.
+To make a button: Insert -> Drawing, draw a shape, Save, then its three-dot menu -> Assign script -> `updateValues`.
+
 ## License
 MIT, Copyright (c) 2026 Quinn Brownell. See `LICENSE`.
 Bundles [@zxing/library](https://github.com/zxing-js/library) 0.21.3 (MIT) in `vendor/zxing.min.js`.
