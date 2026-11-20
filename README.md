@@ -34,6 +34,12 @@ The footer shows "Brickset lookups used today: N/100" (the script's own count, U
 New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".
 Brickset allows about 100 lookups per day per key; cached barcodes cost nothing.
 
+### Recount mode
+Switch the app to **Recount**: each scan adds one to that set's tally (with + / - buttons) and syncs to a **Recount** tab
+instead of Scan Staging. **New recount** clears the tally and the Recount tab. In the sheet, **LEGO Scan -> Compare recount
+to inventory** writes a **Recount Compare** tab: per set, Counted, Personal Qty, Sale Qty and Difference
+(Counted - Personal - Sale). The inventory tabs are only read, never changed.
+
 ### Moving staged rows into your inventory
 Reload the sheet after updating the script; a **LEGO Scan** menu appears. In `Scan Staging`, select the rows
 to move, then **LEGO Scan -> Move selected staging rows to inventory**. Rows go to the Personal or Sale tab

@@ -9,6 +9,8 @@
  *   lookup  { barcode }          -> { ok, found, setNumber, name, theme, year }
  *   bind    { barcode?, setNumber } -> same shape; looks the set up by number and caches barcode -> set
  *   cache   {}                   -> { ok, rows: [{ barcode, setNumber, name, theme, year }] }  (all Lookup Cache rows)
+ *   recount      { items: [{ setNumber, name, counted, ts }] } -> { ok, count }  (upsert by Set # in the Recount tab; counted <= 0 removes)
+ *   recountReset {}              -> { ok }  (clears the Recount tab's rows; never touches the inventory tabs)
  * Every response also carries bsUsed: Brickset API calls made by this script today (UTC).
  * lookup() reads the Lookup Cache tab first and only calls Brickset on a miss.
  *   upsert  { scans: [...] }     -> { ok, count }   (insert, or update by Scan ID)
@@ -39,6 +41,8 @@ function doPost(e) {
     if (req.action === 'lookup') res = lookup(String(req.barcode || ''), bsKey);
     else if (req.action === 'bind') res = bindSet(String(req.barcode || ''), String(req.setNumber || ''), bsKey);
     else if (req.action === 'cache') res = cacheAll();
+    else if (req.action === 'recount') res = recountUpsert(req.items || []);
+    else if (req.action === 'recountReset') res = recountReset();
     else if (req.action === 'upsert') res = upsert(req.scans || []);
     else if (req.action === 'remove') res = remove(req.ids || []);
     else res = { ok: false, error: 'unknown action' };
@@ -215,6 +219,93 @@ function remove(idsToRemove) {
   return { ok: true, count: n };
 }
 
+// ---------- recount: tally per set, kept apart from Scan Staging and the inventory ----------
+const RECOUNT = 'Recount';
+const RCOLS = ['Set #', 'Set Name', 'Counted', 'Updated'];
+const COMPARE = 'Recount Compare';
+
+function recountUpsert(items) {
+  const sh = sheet(RECOUNT, RCOLS);
+  sh.getRange(1, 1, 1, RCOLS.length).setValues([RCOLS]);
+  const last = sh.getLastRow();
+  const keys = last > 1 ? sh.getRange(2, 1, last - 1, 1).getDisplayValues().map(r => r[0]) : [];
+  const del = [];
+  let n = 0;
+  items.forEach(it => {
+    const key = String(it.setNumber);
+    const i = keys.indexOf(key);
+    if (Number(it.counted) <= 0) { if (i >= 0) { del.push(i + 2); keys[i] = null; } n++; return; }
+    const r = i >= 0 ? i + 2 : keys.length + 2;
+    if (i < 0) keys.push(key);
+    sh.getRange(r, 1).setNumberFormat('@');
+    sh.getRange(r, 1, 1, RCOLS.length).setValues([[key, it.name || '', Number(it.counted), new Date(it.ts || Date.now())]]);
+    n++;
+  });
+  del.sort((a, b) => b - a).forEach(r => sh.deleteRow(r)); // bottom-up so row numbers stay valid
+  return { ok: true, count: n };
+}
+
+function recountReset() {
+  const sh = sheet(RECOUNT, RCOLS);
+  const last = sh.getLastRow();
+  if (last > 1) sh.deleteRows(2, last - 1);
+  return { ok: true };
+}
+
+// Menu: LEGO Scan -> Compare recount to inventory. Read-only on the inventory tabs; writes the "Recount Compare" tab.
+function compareRecount() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rc = ss.getSheetByName(RECOUNT);
+  if (!rc || rc.getLastRow() < 2) { ui.alert('The "' + RECOUNT + '" tab is empty. Do a recount in the app first.'); return; }
+
+  const norm = v => String(v).trim().replace(/-\d+$/, ''); // "75192-1" and "75192" are the same set
+  const num = v => Number(String(v).replace(/[^\d.-]/g, '')) || 0;
+  const names = {}, counted = {}, personal = {}, sale = {};
+
+  rc.getRange(2, 1, rc.getLastRow() - 1, 3).getDisplayValues().forEach(r => {
+    const k = norm(r[0]); if (!k) return;
+    counted[k] = (counted[k] || 0) + num(r[2]);
+    if (r[1] && !names[k]) names[k] = r[1];
+  });
+  const sumQty = (tab, nameHdr, into) => {
+    const sh = ss.getSheetByName(tab);
+    if (!sh || sh.getLastRow() < 2) return;
+    const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const si = head.indexOf('Set #'), qi = head.indexOf('Qty'), ni = head.indexOf(nameHdr);
+    if (si < 0 || qi < 0) return;
+    sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getDisplayValues().forEach(r => {
+      const k = norm(r[si]); if (!k) return;
+      into[k] = (into[k] || 0) + num(r[qi]);
+      if (ni >= 0 && r[ni] && !names[k]) names[k] = r[ni];
+    });
+  };
+  sumQty('Personal Inventory', 'Item', personal);
+  sumQty('Sale Inventory', 'Set Name', sale);
+
+  const keys = Object.keys(Object.assign({}, counted, personal, sale));
+  const rows = keys.map(k => {
+    const c = counted[k] || 0, p = personal[k] || 0, s = sale[k] || 0, d = c - p - s;
+    const note = c === 0 && p + s > 0 ? 'Not counted' : d === 0 ? 'OK' : d < 0 ? 'Missing ' + (-d) : 'Extra ' + d;
+    return [k, names[k] || '', c, p, s, d, note];
+  }).sort((a, b) => (a[5] === 0) - (b[5] === 0) || a[0].localeCompare(b[0], undefined, { numeric: true }));
+
+  let out = ss.getSheetByName(COMPARE);
+  if (!out) out = ss.insertSheet(COMPARE);
+  out.clear();
+  const head = ['Set #', 'Set Name', 'Counted', 'Personal Qty', 'Sale Qty', 'Difference', 'Note'];
+  out.getRange(1, 1, 1, head.length).setValues([head]);
+  out.setFrozenRows(1);
+  out.getRange(2, 1, rows.length, 1).setNumberFormat('@');
+  out.getRange(2, 1, rows.length, head.length).setValues(rows);
+  const bg = rows.map(r => Array(head.length).fill(r[5] === 0 ? '#ffffff' : r[5] < 0 ? '#fce8e6' : '#fff4ce'));
+  out.getRange(2, 1, rows.length, head.length).setBackgrounds(bg);
+
+  const off = rows.filter(r => r[5] !== 0).length;
+  ui.alert('Compared ' + rows.length + ' set(s): ' + (rows.length - off) + ' match, ' + off + ' differ.\n\nSee the "' + COMPARE + '" tab. ' +
+    'Difference = Counted - (Personal + Sale). Your inventory tabs were not changed.');
+}
+
 // ---------- menu: move staging rows into the real inventory tabs ----------
 // Only columns that exist in the target tab are written. Cells the scanner has no value for stay blank,
 // except the Sale tab's per-row formulas (copied from the row above) and its Fee % / Target Profit defaults.
@@ -241,6 +332,7 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('LEGO Scan')
     .addItem('Move selected staging rows to inventory', 'moveSelected')
     .addItem('Update values for selected rows (Brickset)', 'updateValues')
+    .addItem('Compare recount to inventory', 'compareRecount')
     .addToUi();
 }
 

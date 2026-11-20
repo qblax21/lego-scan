@@ -14,16 +14,23 @@
 </head>
 <body>
 <main>
-  <div class="seg" role="group" aria-label="Destination">
-    <button id="destPersonal" class="on">Personal</button>
-    <button id="destSale">Sale</button>
+  <div class="seg modes" role="group" aria-label="Mode">
+    <button id="modeScan" class="on">Scan</button>
+    <button id="modeRecount">Recount</button>
   </div>
 
-  <select id="cond" aria-label="Condition"></select>
-  <details id="more" class="more">
-    <summary>More details (optional)</summary>
-    <div id="fields"></div>
-  </details>
+  <div id="scanOnly">
+    <div class="seg" role="group" aria-label="Destination">
+      <button id="destPersonal" class="on">Personal</button>
+      <button id="destSale">Sale</button>
+    </div>
+
+    <select id="cond" aria-label="Condition"></select>
+    <details id="more" class="more">
+      <summary>More details (optional)</summary>
+      <div id="fields"></div>
+    </details>
+  </div>
 
   <div class="cam">
     <video id="video" playsinline muted></video>
@@ -39,11 +46,21 @@
     <button type="submit">Add</button>
   </form>
 
-  <div class="row">
-    <h2>Last 5 scans</h2>
-    <button id="undoBtn" class="ghost" disabled>Undo last</button>
+  <div id="scanBox">
+    <div class="row">
+      <h2>Last 5 scans</h2>
+      <button id="undoBtn" class="ghost" disabled>Undo last</button>
+    </div>
+    <ul id="list" class="list"></ul>
   </div>
-  <ul id="list" class="list"></ul>
+
+  <div id="recountBox" hidden>
+    <div class="row">
+      <h2 id="rcTitle">Recount</h2>
+      <button id="rcReset" class="ghost">New recount</button>
+    </div>
+    <ul id="rcList" class="list"></ul>
+  </div>
 
   <p id="bsUse" class="bs"></p>
   <div class="foot">
@@ -54,8 +71,8 @@
 <div id="dlg" class="dlg" hidden>
   <div class="box">
     <p id="dlgText"></p>
-    <button id="dlgYes">Add 1</button>
-    <button id="dlgNo" class="ghost">New row</button>
+    <button id="dlgYes">Yes</button>
+    <button id="dlgNo" class="ghost">No</button>
   </div>
 </div>
 <div id="dlgSet" class="dlg" hidden>

@@ -5,12 +5,16 @@
 const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
   cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept',
-  binds: 'legoscan.pendingBinds', bs: 'legoscan.bsUsed' };
+  binds: 'legoscan.pendingBinds', bs: 'legoscan.bsUsed', mode: 'legoscan.mode', recount: 'legoscan.recount',
+  rreset: 'legoscan.recountReset' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 let scans = load(LS.scans, []);
 let dest = load(LS.dest, 'Personal');
+let mode = load(LS.mode, 'scan');                 // 'scan' (adds rows to Scan Staging) or 'recount' (tallies per set)
+let recount = load(LS.recount, {});               // setNumber -> { setNumber, name, qty, ts, synced }
+let recountResetPending = load(LS.rreset, false); // "New recount" done offline; clear the Recount tab on next sync
 const lookupCache = load(LS.cache, {}); // barcode -> {setNumber,name,year}
 
 // ---------- code helpers ----------
@@ -130,6 +134,16 @@ async function sync() {
       await api('upsert', { scans: pending });
       pending.forEach(s => { s.synced = true; });
     }
+    // recount tally -> Recount tab (a reset from "New recount" goes first)
+    if (recountResetPending) { didWork = true; await api('recountReset'); recountResetPending = false; save(LS.rreset, false); }
+    const rp = Object.values(recount).filter(x => !x.synced).map(x => [x, x.qty]);
+    if (rp.length) {
+      didWork = true;
+      await api('recount', { items: rp.map(([x, q]) => ({ setNumber: x.setNumber, name: x.name, counted: q, ts: x.ts })) });
+      rp.forEach(([x, q]) => { if (x.qty === q) x.synced = true; }); // a tap during the request stays pending
+      Object.keys(recount).forEach(k => { if (recount[k].qty <= 0 && recount[k].synced) delete recount[k]; });
+      save(LS.recount, recount); renderRecount();
+    }
     save(LS.scans, scans); render();
     if (didWork) await pullCache(); // after a sync that changed something, refresh the offline cache
   } catch (e) { $('net').textContent = 'Sync failed: ' + e.message; }
@@ -138,9 +152,9 @@ async function sync() {
 setInterval(sync, 30000);
 
 // ---------- in-page dialog (native confirm/prompt pause the camera feed on iOS) ----------
-function ask(text) {
+function ask(text, yes = 'Add 1', no = 'New row') {
   return new Promise(res => {
-    $('dlgText').textContent = text; $('dlg').hidden = false;
+    $('dlgText').textContent = text; $('dlgYes').textContent = yes; $('dlgNo').textContent = no; $('dlg').hidden = false;
     const done = v => { $('dlg').hidden = true; $('dlgYes').onclick = $('dlgNo').onclick = null; lastAt = Date.now(); res(v); };
     $('dlgYes').onclick = () => done(true);
     $('dlgNo').onclick = () => done(false);
@@ -202,6 +216,7 @@ let bindNote = '';
 async function addEntry({ barcode = '', setNumber = '', info = null }) {
   if (!info && barcode && !setNumber) { say('Looking up ' + barcode + '...'); lookupError = ''; info = await lookup(barcode); }
   if (info) setNumber = info.setNumber;
+  if (mode === 'recount') return recountAdd(setNumber, info, barcode);
 
   // duplicate: same set (or same unresolved barcode) in the same destination
   const dup = scans.find(s => s.dest === dest && s.condition === $('cond').value && !s.undone &&
@@ -226,6 +241,58 @@ async function addEntry({ barcode = '', setNumber = '', info = null }) {
     : `Saved barcode ${barcode} - needs set number` + (lookupError ? ` (lookup error: ${lookupError})` : configured() && navigator.onLine ? ' (not found in Brickset)' : ''));
   bindNote = '';
 }
+
+// ---------- recount mode: one tally per set, synced to the "Recount" tab (never Scan Staging or the inventory) ----------
+function recountAdd(setNumber, info, barcode) {
+  if (!setNumber) { say(`Recount needs a set number - skipped barcode ${barcode || ''}`); return; }
+  const it = recount[setNumber] || (recount[setNumber] = { setNumber, name: '', qty: 0 });
+  if (info?.name && !it.name) it.name = info.name;
+  it.qty += 1; it.ts = Date.now(); it.synced = false;
+  save(LS.recount, recount); renderRecount(); sync();
+  say(`Counted set ${setNumber}${it.name ? ' - ' + it.name : ''}: ${it.qty}`);
+}
+function recountAdjust(setNumber, d) {
+  const it = recount[setNumber]; if (!it) return;
+  it.qty = Math.max(0, it.qty + d); it.ts = Date.now(); it.synced = false;
+  save(LS.recount, recount); renderRecount(); sync();
+}
+function renderRecount() {
+  const ul = $('rcList'); ul.textContent = '';
+  const items = Object.values(recount).filter(x => x.qty > 0).sort((a, b) => b.ts - a.ts);
+  items.forEach(it => {
+    const li = document.createElement('li');
+    const left = document.createElement('div');
+    const t = document.createElement('div'); t.className = 't'; t.textContent = it.setNumber;
+    const s = document.createElement('div'); s.className = 's'; s.textContent = it.name || '(name not looked up)';
+    left.append(t, s);
+    const ctl = document.createElement('div'); ctl.className = 'rc';
+    const minus = document.createElement('button'); minus.textContent = '-'; minus.setAttribute('aria-label', 'one less');
+    const n = document.createElement('b'); n.textContent = it.qty;
+    const plus = document.createElement('button'); plus.textContent = '+'; plus.setAttribute('aria-label', 'one more');
+    minus.onclick = () => recountAdjust(it.setNumber, -1); plus.onclick = () => recountAdjust(it.setNumber, 1);
+    ctl.append(minus, n, plus);
+    li.append(left, ctl); ul.append(li);
+  });
+  const boxes = items.reduce((a, x) => a + x.qty, 0);
+  $('rcTitle').textContent = `Recount: ${items.length} sets, ${boxes} boxes`;
+}
+function setMode(m) {
+  mode = m; save(LS.mode, m);
+  $('modeScan').classList.toggle('on', m === 'scan');
+  $('modeRecount').classList.toggle('on', m === 'recount');
+  $('scanOnly').hidden = $('scanBox').hidden = m === 'recount';
+  $('recountBox').hidden = m !== 'recount';
+  say(m === 'recount' ? 'Recount: scan each box once; use + and - to fix a count' : 'Point at a box barcode');
+  renderRecount();
+}
+$('modeScan').onclick = () => setMode('scan');
+$('modeRecount').onclick = () => setMode('recount');
+$('rcReset').onclick = async () => {
+  if (!await ask('Start a new recount? This clears the tally here and the Recount tab in your sheet. Your inventory is not touched.', 'Clear it', 'Cancel')) return;
+  recount = {}; save(LS.recount, recount);
+  if (configured()) { recountResetPending = true; save(LS.rreset, true); }
+  renderRecount(); sync();
+};
 
 // ---------- scanning ----------
 const video = $('video');
@@ -493,6 +560,14 @@ window.addEventListener('online', () => { render(); sync(); });
 window.addEventListener('offline', render);
 
 $('csvBtn').onclick = () => {
+  if (mode === 'recount') { // export the tally instead of the scan list
+    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = ['setNumber,name,counted'].concat(Object.values(recount).filter(x => x.qty > 0).map(x => [x.setNumber, x.name, x.qty].map(esc).join(',')));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
+    a.download = 'lego-recount.csv'; a.click();
+    return;
+  }
   const extraKeys = [...new Set(Object.values(FIELDS).flat().map(f => f.key))];
   const cols = ['setNumber', 'name', 'theme', 'year', 'barcode', 'dest', 'condition', 'qty', 'status', 'ts'];
   const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
@@ -514,5 +589,5 @@ $('cfgBtn').onclick = () => {
   save(LS.cfg, cfg); render(); sync(); pullCache();
 };
 
-setDest(dest); render(); pullCache().then(sync);
+setDest(dest); render(); setMode(mode); pullCache().then(sync);
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
