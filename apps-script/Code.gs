@@ -338,40 +338,91 @@ function onOpen() {
 
 // ---------- market values from the Brickset set page ----------
 // Brickset's API has no market value, but each set page shows "Current value" (New / Used, from BrickLink) for
-// retired sets and only the RRP for sets still in production. Rule: sealed/new -> New value, anything else -> Used
-// value, and if the page has no current value (not retired) -> the US retail price (RRP).
+// many retired sets, and only the RRP for sets still in production.
+//   Sealed/New -> the New value; anything else -> the Used value.
+//   No market value on a set that is NOT retired (exit date in the future or to be announced) -> US retail price (RRP),
+//     recorded as "Retail fallback".
+//   No market value on a RETIRED set, or one with no exit date at all -> nothing is written and the row is flagged.
+// Two helper columns are added to the tab: "Value Source" and "Value Updated".
 const VALUE_TABS = {
   'Personal Inventory': { set: 'Set #', cond: 'Condition', qty: 'Qty', unit: 'Value of One', total: 'Estimated Current Value' },
   'Sale Inventory': { set: 'Set #', cond: 'Condition', price: 'Est. Sale Price' },
 };
+const SRC_COL = 'Value Source', UPD_COL = 'Value Updated';
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+const MAX_VALUE_ROWS = 120, MAX_BLOCKED_IN_A_ROW = 3;
 
-function parseBricksetValues(html) {
+function parseBricksetDate(s) { // "31 Dec 01" -> Date (UTC), or null
+  const m = /(\d{1,2})\s+([A-Za-z]{3})\w*\s+(\d{2,4})/.exec(s || '');
+  if (!m || !(m[2].toLowerCase() in MONTHS)) return null;
+  let y = Number(m[3]); if (y < 100) y += y > 70 ? 1900 : 2000;
+  return new Date(Date.UTC(y, MONTHS[m[2].toLowerCase()], Number(m[1])));
+}
+
+function parseBricksetPage(html, now) {
   const money = s => { const m = /\$\s*([\d,]+(?:\.\d+)?)/.exec(s || ''); return m ? parseFloat(m[1].replace(/,/g, '')) : null; };
   const cv = /<dt>\s*Current value\s*<\/dt>\s*<dd>([\s\S]*?)<\/dd>/i.exec(html);
   const nw = cv ? /New:([\s\S]*?)(?:<br|$)/i.exec(cv[1]) : null;
   const us = cv ? /Used:([\s\S]*)$/i.exec(cv[1]) : null;
   const rrp = /<dt>\s*RRP\s*<\/dt>\s*<dd>([\s\S]*?)<\/dd>/i.exec(html);
-  return { newValue: nw ? money(nw[1]) : null, usedValue: us ? money(us[1]) : null, rrp: rrp ? money(rrp[1]) : null };
+  // Launch/exit reads "01 Jul 00 - 31 Dec 01"; the exit part can be a date, "{t.b.a}" or missing.
+  let retired = null;
+  const le = /<dt>\s*Launch\/exit\s*<\/dt>\s*<dd>([\s\S]*?)<\/dd>/i.exec(html);
+  if (le) {
+    const text = le[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (text) {
+      const parts = text.split(/\s+-\s+/);
+      const exit = parts.length > 1 ? parseBricksetDate(parts[1]) : null;
+      retired = exit ? exit.getTime() <= (now || new Date()).getTime() : false;
+    }
+  }
+  return { newValue: nw ? money(nw[1]) : null, usedValue: us ? money(us[1]) : null, rrp: rrp ? money(rrp[1]) : null, retired: retired };
 }
 
+// -> { status: 'ok', page } | { status: 'notfound' } | { status: 'blocked', detail }
 function bricksetPage(setNum) {
   const n = /-\d+$/.test(setNum) ? setNum : setNum + '-1';
-  const res = UrlFetchApp.fetch('https://brickset.com/sets/' + encodeURIComponent(n), {
-    muteHttpExceptions: true, followRedirects: true,
-    headers: { 'User-Agent': 'Mozilla/5.0 (personal LEGO inventory sheet)' },
-  });
-  if (res.getResponseCode() !== 200) return null;
+  let res;
+  try {
+    res = UrlFetchApp.fetch('https://brickset.com/sets/' + encodeURIComponent(n), {
+      muteHttpExceptions: true, followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (personal LEGO inventory sheet)' },
+    });
+  } catch (e) { return { status: 'blocked', detail: String(e).slice(0, 80) }; }
+  const code = res.getResponseCode();
+  if (code === 404) return { status: 'notfound' };
+  if (code !== 200) return { status: 'blocked', detail: 'HTTP ' + code };
   const html = res.getContentText();
-  if (/Page not found/i.test(html) && !/<dt>\s*Number\s*<\/dt>/i.test(html)) return null;
-  return parseBricksetValues(html);
+  if (/<dt>\s*Number\s*<\/dt>/i.test(html)) return { status: 'ok', page: parseBricksetPage(html) };
+  if (/Page not found/i.test(html)) return { status: 'notfound' };
+  return { status: 'blocked', detail: 'unrecognised page (possibly a bot check)' };
 }
 
-function pickValue(v, condition) {
+// -> { price, source } or { flag }
+function decideValue(page, condition) {
   const isNew = /^(sealed|new)$/i.test(String(condition).trim());
-  const want = isNew ? v.newValue : v.usedValue;
-  if (want != null) return { price: want, source: isNew ? 'new value' : 'used value' };
-  if (v.rrp != null) return { price: v.rrp, source: 'retail (no market value listed)' };
-  return null;
+  if (page.newValue != null || page.usedValue != null) {
+    const v = isNew ? page.newValue : page.usedValue;
+    return v != null ? { price: v, source: isNew ? 'Brickset New' : 'Brickset Used' }
+      : { flag: 'No ' + (isNew ? 'New' : 'Used') + ' value on Brickset' };
+  }
+  if (page.retired === false) return page.rrp != null ? { price: page.rrp, source: 'Retail fallback' } : { flag: 'No retail price listed' };
+  if (page.retired === true) return { flag: 'Retired - no market value' };
+  return { flag: 'No market value (status unknown)' };
+}
+
+// Find a header by name, or add it after the last used header (matching that header's formatting).
+function ensureCol(sh, name) {
+  const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const i = head.indexOf(name);
+  if (i >= 0) return i + 1;
+  let last = head.length;
+  while (last > 0 && String(head[last - 1]).trim() === '') last--;
+  const c = last + 1;
+  if (c > sh.getMaxColumns()) sh.insertColumnsAfter(sh.getMaxColumns(), c - sh.getMaxColumns());
+  if (last > 0) sh.getRange(1, last).copyTo(sh.getRange(1, c), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  sh.getRange(1, c).setValue(name);
+  return c;
 }
 
 function updateValues() {
@@ -387,55 +438,100 @@ function updateValues() {
   ranges.forEach(r => { for (let i = r.getRow(); i < r.getRow() + r.getNumRows(); i++) if (i >= 2) rowNums[i] = true; });
   const rows = Object.keys(rowNums).map(Number).sort((a, b) => a - b);
   if (!rows.length) { ui.alert('Select the rows to update (not the header) first.'); return; }
-  if (rows.length > 120) { ui.alert('That is ' + rows.length + ' rows. Please select 120 or fewer at a time.'); return; }
+  if (rows.length > MAX_VALUE_ROWS) { ui.alert('That is ' + rows.length + ' rows. Please select ' + MAX_VALUE_ROWS + ' or fewer at a time.'); return; }
 
   const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
   const col = name => head.indexOf(name) + 1;
   const setCol = col(t.set), condCol = col(t.cond);
-  const target = t.price ? col(t.price) : col(t.unit) || col(t.total);
-  if (!setCol || !condCol || !target) { ui.alert('Could not find the expected columns on this tab.'); return; }
+  const valueCols = (t.price ? [col(t.price)] : [col(t.unit), col(t.total)]).filter(c => c > 0);
+  if (!setCol || !condCol || !valueCols.length) { ui.alert('Could not find the expected columns on this tab.'); return; }
 
   const todo = [], skipped = [];
   rows.forEach(r => {
     const setNum = String(sh.getRange(r, setCol).getDisplayValue()).trim();
     const cond = String(sh.getRange(r, condCol).getDisplayValue()).trim();
-    if (!setNum) skipped.push('row ' + r + ': no set number');
-    else if (!cond) skipped.push('row ' + r + ' (' + setNum + '): no condition');
-    else todo.push({ r: r, setNum: setNum, cond: cond });
+    if (!setNum) { skipped.push('row ' + r + ': no set number'); return; }
+    if (!cond) { skipped.push('row ' + r + ' (' + setNum + '): no condition'); return; }
+    const existing = valueCols.map(c => String(sh.getRange(r, c).getDisplayValue()).trim()).filter(Boolean);
+    todo.push({ r: r, setNum: setNum, cond: cond, existing: existing.length ? existing[0] : '' });
   });
   if (!todo.length) { ui.alert('Nothing to update.\n\n' + skipped.join('\n')); return; }
 
-  const what = t.price ? '"' + t.price + '"' : '"' + (t.unit || t.total) + '"' + (t.unit && t.total ? ' and "' + t.total + '"' : '');
-  const ask = 'Look up ' + todo.length + ' row(s) on Brickset and overwrite ' + what + '?' +
-    '\nSealed/New use the New value; everything else uses the Used value; sets without a market value use retail.' +
-    (skipped.length ? '\n\nSkipping:\n' + skipped.join('\n') : '');
-  if (ui.alert('Update values', ask, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  // Confirm. If some rows already hold a value, ask whether to overwrite them.
+  const withValue = todo.filter(o => o.existing);
+  const base = 'Look up ' + todo.length + ' row(s) on Brickset.\nSealed/New use the New value, everything else the Used value; ' +
+    'not-yet-retired sets without a market value use retail; retired sets without one are flagged and left alone.';
+  const skipNote = skipped.length ? '\n\nSkipping:\n' + skipped.join('\n') : '';
+  let overwrite = true;
+  if (withValue.length) {
+    const eg = withValue.slice(0, 6).map(o => 'row ' + o.r + ' (' + o.setNum + ') has ' + o.existing).join('\n');
+    const ans = ui.alert('Overwrite existing values?', withValue.length + ' of ' + todo.length + ' row(s) already have a value:\n' + eg +
+      (withValue.length > 6 ? '\n...and ' + (withValue.length - 6) + ' more' : '') + '\n\n' + base + skipNote +
+      '\n\nYes = overwrite them.   No = only fill the empty ones.   Cancel = stop.', ui.ButtonSet.YES_NO_CANCEL);
+    if (ans === ui.Button.CANCEL || ans === ui.Button.CLOSE) return;
+    overwrite = ans === ui.Button.YES;
+  } else if (ui.alert('Update values', base + skipNote, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
 
-  const cache = {}, notes = [];
-  let done = 0;
-  todo.forEach(o => {
-    if (!(o.setNum in cache)) {
-      try { cache[o.setNum] = bricksetPage(o.setNum); } catch (e) { cache[o.setNum] = null; }
+  const work = overwrite ? todo : todo.filter(o => !o.existing);
+  if (!overwrite) todo.filter(o => o.existing).forEach(o => skipped.push('row ' + o.r + ' (' + o.setNum + '): already has a value'));
+  if (!work.length) { ui.alert('Nothing to update.\n\n' + skipped.join('\n')); return; }
+
+  const srcCol = ensureCol(sh, SRC_COL), updCol = ensureCol(sh, UPD_COL);
+  const pages = {};
+  const updated = [], noPrice = [], notFound = [], blocked = [];
+  let blockedStreak = 0, stoppedAt = -1;
+
+  for (let k = 0; k < work.length; k++) {
+    const o = work[k];
+    if (!(o.setNum in pages)) {
+      pages[o.setNum] = bricksetPage(o.setNum);
       Utilities.sleep(500); // be gentle with Brickset
+      blockedStreak = pages[o.setNum].status === 'blocked' ? blockedStreak + 1 : 0;
+      if (blockedStreak >= MAX_BLOCKED_IN_A_ROW) { stoppedAt = k; }
     }
-    const v = cache[o.setNum];
-    const pick = v ? pickValue(v, o.cond) : null;
-    if (!pick) { notes.push('row ' + o.r + ' (' + o.setNum + '): no price found, left unchanged'); return; }
+    const pg = pages[o.setNum];
+    const label = 'row ' + o.r + ' (' + o.setNum + ', ' + o.cond + ')';
+    if (pg.status === 'blocked') { blocked.push(label + ': ' + pg.detail); if (stoppedAt >= 0) break; continue; }
+    if (pg.status === 'notfound') {
+      notFound.push(label + ': set not found on Brickset');
+      if (!o.existing) sh.getRange(o.r, srcCol).setValue('Set not found on Brickset');
+      continue;
+    }
+    const d = decideValue(pg.page, o.cond);
+    if (d.flag) {
+      noPrice.push(label + ': ' + d.flag);
+      if (!o.existing) sh.getRange(o.r, srcCol).setValue(d.flag); // leave the value blank, say why
+      continue;
+    }
     if (t.price) {
-      sh.getRange(o.r, target).setValue(pick.price);
-    } else if (t.unit && t.total && col(t.qty)) {
-      sh.getRange(o.r, col(t.unit)).setValue(pick.price); // Value of One
+      sh.getRange(o.r, col(t.price)).setValue(d.price);
+    } else if (col(t.unit) && col(t.total) && col(t.qty)) {
+      sh.getRange(o.r, col(t.unit)).setValue(d.price); // Value of One
       const u = sh.getRange(o.r, col(t.unit)).getA1Notation(), q = sh.getRange(o.r, col(t.qty)).getA1Notation();
       sh.getRange(o.r, col(t.total)).setFormula('=' + u + '*' + q); // Est. Current Value = value x qty
     } else {
       const qty = Number(sh.getRange(o.r, col(t.qty)).getValue()) || 1;
-      sh.getRange(o.r, target).setValue(pick.price * qty);
+      sh.getRange(o.r, valueCols[0]).setValue(d.price * qty);
     }
-    notes.push('row ' + o.r + ' (' + o.setNum + ', ' + o.cond + '): $' + pick.price + ' - ' + pick.source);
-    done++;
-  });
-  ui.alert('Updated ' + done + ' of ' + todo.length + ' row(s).\n\n' + notes.slice(0, 25).join('\n') +
-    (notes.length > 25 ? '\n...and ' + (notes.length - 25) + ' more' : ''));
+    sh.getRange(o.r, srcCol).setValue(d.source);
+    const dc = sh.getRange(o.r, updCol);
+    dc.setNumberFormat('yyyy-mm-dd');
+    dc.setValue(new Date());
+    updated.push(label + ': $' + d.price + ' - ' + d.source);
+  }
+  if (stoppedAt >= 0) {
+    for (let k = stoppedAt + 1; k < work.length; k++) blocked.push('row ' + work[k].r + ' (' + work[k].setNum + '): not tried');
+  }
+
+  const lines = [
+    'Updated: ' + updated.length,
+    'Skipped: ' + skipped.length,
+    'No price: ' + (noPrice.length + notFound.length) + (notFound.length ? ' (' + notFound.length + ' not found on Brickset)' : ''),
+    'Fetch blocked: ' + blocked.length + (stoppedAt >= 0 ? ' (stopped early after ' + MAX_BLOCKED_IN_A_ROW + ' blocked requests in a row)' : ''),
+  ];
+  const detail = [].concat(updated, noPrice, notFound, blocked, skipped);
+  ui.alert('Value update finished', lines.join('\n') + '\n\n' + detail.slice(0, 25).join('\n') +
+    (detail.length > 25 ? '\n...and ' + (detail.length - 25) + ' more' : ''), ui.ButtonSet.OK);
 }
 
 function listFor(sh, row, col) { // allowed dropdown values for a column, read from an existing row
