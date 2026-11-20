@@ -8,6 +8,9 @@
  * Requests are POSTed as text/plain JSON: { token, action, ... }
  *   lookup  { barcode }          -> { ok, found, setNumber, name, theme, year }
  *   bind    { barcode?, setNumber } -> same shape; looks the set up by number and caches barcode -> set
+ *   cache   {}                   -> { ok, rows: [{ barcode, setNumber, name, theme, year }] }  (all Lookup Cache rows)
+ * Every response also carries bsUsed: Brickset API calls made by this script today (UTC).
+ * lookup() reads the Lookup Cache tab first and only calls Brickset on a miss.
  *   upsert  { scans: [...] }     -> { ok, count }   (insert, or update by Scan ID)
  *   remove  { ids: [...] }       -> { ok, count }
  */
@@ -32,11 +35,15 @@ function doPost(e) {
   lock.waitLock(20000);
   try {
     const bsKey = (props.getProperty('BRICKSET_KEY') || '').trim();
-    if (req.action === 'lookup') return out(lookup(String(req.barcode || ''), bsKey));
-    if (req.action === 'bind') return out(bindSet(String(req.barcode || ''), String(req.setNumber || ''), bsKey));
-    if (req.action === 'upsert') return out(upsert(req.scans || []));
-    if (req.action === 'remove') return out(remove(req.ids || []));
-    return out({ ok: false, error: 'unknown action' });
+    let res;
+    if (req.action === 'lookup') res = lookup(String(req.barcode || ''), bsKey);
+    else if (req.action === 'bind') res = bindSet(String(req.barcode || ''), String(req.setNumber || ''), bsKey);
+    else if (req.action === 'cache') res = cacheAll();
+    else if (req.action === 'upsert') res = upsert(req.scans || []);
+    else if (req.action === 'remove') res = remove(req.ids || []);
+    else res = { ok: false, error: 'unknown action' };
+    res.bsUsed = bsCountToday(); // Brickset API calls this script has made today (UTC), so the app can show N/100
+    return out(res);
   } catch (err) {
     return out({ ok: false, error: String(err) });
   } finally {
@@ -69,10 +76,9 @@ function lookup(barcode, key) {
   }
   if (!key) return { ok: false, error: 'BRICKSET_KEY not set' };
 
-  // Brickset stores EAN-13 as-is and UPC-A as 12 digits, so try the 13-digit form first,
-  // then the 12-digit form when the code starts with 0. (Undocumented but verified.)
-  const tries = [barcode];
-  if (barcode.length === 13 && barcode[0] === '0') tries.push(barcode.slice(1));
+  // Brickset stores EAN-13 as-is and UPC-A as 12 digits. A 13-digit code starting with 0 is really a UPC-A,
+  // so try the 12-digit form first (saves a call), then the 13-digit form. (Undocumented but verified.)
+  const tries = barcode.length === 13 && barcode[0] === '0' ? [barcode.slice(1), barcode] : [barcode];
   for (const q of tries) {
     const set = bricksetQuery(q, key);
     if (set) {
@@ -117,7 +123,26 @@ function bindSet(barcode, setInput, key) {
   return Object.assign({ ok: true, found: !!rec }, result);
 }
 
+// ---------- Brickset daily call counter (the key allows about 100 getSets calls a day) ----------
+function utcDay() { return Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'); }
+function bsCountToday() {
+  const p = PropertiesService.getScriptProperties();
+  return p.getProperty('BS_DAY') === utcDay() ? Number(p.getProperty('BS_COUNT') || 0) : 0;
+}
+function bsCountBump() {
+  PropertiesService.getScriptProperties().setProperties({ BS_DAY: utcDay(), BS_COUNT: String(bsCountToday() + 1) });
+}
+
+// Every row of the Lookup Cache tab, so the app can match known barcodes offline without calling Brickset.
+function cacheAll() {
+  const cache = sheet(CACHE, ['Barcode', 'Set #', 'Set Name', 'Theme', 'Year', 'Cached At']);
+  const last = cache.getLastRow();
+  const rows = last > 1 ? cache.getRange(2, 1, last - 1, 5).getDisplayValues() : [];
+  return { ok: true, rows: rows.filter(r => r[0] && r[1]).map(r => ({ barcode: r[0], setNumber: r[1], name: r[2], theme: r[3], year: r[4] })) };
+}
+
 function bricksetGetSets(params, key) {
+  bsCountBump();
   // Built by hand: Brickset 500s if userHash is missing, and an object payload drops empty values.
   const body = 'apiKey=' + encodeURIComponent(key) + '&userHash=' +
     '&params=' + encodeURIComponent(JSON.stringify(params));

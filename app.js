@@ -5,7 +5,7 @@
 const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
   cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept',
-  binds: 'legoscan.pendingBinds' };
+  binds: 'legoscan.pendingBinds', bs: 'legoscan.bsUsed' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -28,13 +28,41 @@ let cfg = load(LS.cfg, { url: '', secret: '' });
 let removals = load(LS.removals, []);
 const configured = () => !!(cfg.url && cfg.secret);
 
+// Brickset API calls the script has made today (UTC), as last reported by the script. Limit is about 100 a day.
+const BS_LIMIT = 100;
+let bsInfo = load(LS.bs, null);
+const utcDay = () => new Date().toISOString().slice(0, 10);
+function renderBs() {
+  const el = $('bsUse');
+  if (!configured()) { el.textContent = ''; return; }
+  const used = bsInfo && bsInfo.day === utcDay() ? bsInfo.used : 0;
+  el.textContent = `Brickset lookups used today: ${used}/${BS_LIMIT}`;
+  el.classList.toggle('warn', used >= BS_LIMIT * 0.8);
+}
+
 async function api(action, payload) {
   const r = await fetch(cfg.url, { method: 'POST', redirect: 'follow',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // text/plain avoids a CORS preflight
     body: JSON.stringify({ token: cfg.secret, action, ...payload }) });
   const j = await r.json();
+  if (typeof j.bsUsed === 'number') { bsInfo = { day: utcDay(), used: j.bsUsed }; save(LS.bs, bsInfo); renderBs(); }
   if (!j.ok) throw new Error(j.error || 'request failed');
   return j;
+}
+
+// Pull every barcode -> set the sheet knows into the local cache, so known barcodes match offline
+// and never spend a Brickset call. Barcodes with a set number still waiting to sync are left alone.
+async function pullCache() {
+  if (!configured() || !navigator.onLine) return;
+  try {
+    const j = await api('cache');
+    const pending = new Set(pendingBinds.map(b => b.barcode));
+    (j.rows || []).forEach(r => {
+      const bc = normBarcode(String(r.barcode));
+      if (!pending.has(bc)) lookupCache[bc] = { setNumber: String(r.setNumber), name: r.name || '', theme: r.theme || '', year: r.year || '' };
+    });
+    save(LS.cache, lookupCache);
+  } catch { /* offline or script error: keep what we have */ }
 }
 
 async function lookup(barcode) {
@@ -81,8 +109,10 @@ let syncing = false;
 async function sync() {
   if (!configured() || !navigator.onLine || syncing) return;
   syncing = true;
+  let didWork = false;
   try {
     for (const b of [...pendingBinds]) { // set numbers typed while offline
+      didWork = true;
       const j = await api('bind', { barcode: b.barcode, setNumber: b.setNumber });
       const rec = { setNumber: j.setNumber, name: j.name || '', theme: j.theme || '', year: j.year || '' };
       lookupCache[b.barcode] = rec; save(LS.cache, lookupCache);
@@ -93,13 +123,15 @@ async function sync() {
       const info = await lookup(s.barcode);
       if (info) Object.assign(s, { setNumber: info.setNumber, name: info.name, theme: info.theme || '', year: info.year || '', status: 'matched', synced: false });
     }
-    if (removals.length) { await api('remove', { ids: removals }); removals = []; save(LS.removals, removals); }
+    if (removals.length) { didWork = true; await api('remove', { ids: removals }); removals = []; save(LS.removals, removals); }
     const pending = scans.filter(s => !s.synced);
     if (pending.length) {
+      didWork = true;
       await api('upsert', { scans: pending });
       pending.forEach(s => { s.synced = true; });
     }
     save(LS.scans, scans); render();
+    if (didWork) await pullCache(); // after a sync that changed something, refresh the offline cache
   } catch (e) { $('net').textContent = 'Sync failed: ' + e.message; }
   syncing = false;
 }
@@ -452,6 +484,7 @@ function render() {
     ul.append(li);
   });
   $('undoBtn').disabled = !scans.length;
+  renderBs();
   const pending = scans.filter(s => !s.synced).length;
   $('net').textContent = `${navigator.onLine ? 'Online' : 'Offline'} - ${scans.length} scans` +
     (configured() ? ` (${pending} waiting to sync)` : ' (Sheets not connected)');
@@ -478,8 +511,8 @@ $('cfgBtn').onclick = () => {
   resumeCam();
   if (secret === null) return;
   cfg = { url: url.trim(), secret: (secret || '').trim() };
-  save(LS.cfg, cfg); render(); sync();
+  save(LS.cfg, cfg); render(); sync(); pullCache();
 };
 
-setDest(dest); render(); sync();
+setDest(dest); render(); pullCache().then(sync);
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

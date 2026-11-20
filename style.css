@@ -47,4 +47,6 @@ h2{font-size:16px;margin:0;color:var(--mut);font-weight:600}
 .dlg input{min-height:56px;border-radius:12px;border:1px solid #444;background:var(--bg);color:var(--fg);padding:0 14px;font-size:24px;text-align:center;width:100%}
 .dlg .err{color:var(--warn);font-size:14px;min-height:1.2em;margin:0}
 .list li.fix{border-left:4px solid var(--warn);cursor:pointer}
+.bs{margin:6px 0;font-size:12px;color:var(--mut);text-align:right}
+.bs.warn{color:var(--warn)}
 .foot{display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:14px}

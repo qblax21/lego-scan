@@ -29,6 +29,8 @@ The scanner works without this. To connect your own sheet:
 3. Deploy -> New deployment -> type "Web app" -> Execute as: Me -> Who has access: Anyone -> Deploy.
    Authorize when asked, then copy the web app URL.
 4. In the app tap "Sheets", paste the URL, then the secret. Both stay on your phone only.
+The app also pulls the whole Lookup Cache on launch and after syncs, so known barcodes match offline and cost no Brickset call.
+The footer shows "Brickset lookups used today: N/100" (the script's own count, UTC day).
 New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".
 Brickset allows about 100 lookups per day per key; cached barcodes cost nothing.
 
