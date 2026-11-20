@@ -4,7 +4,8 @@
 
 const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
-  cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept' };
+  cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept',
+  binds: 'legoscan.pendingBinds' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -50,11 +51,44 @@ async function lookup(barcode) {
 let lookupError = '';
 const notFound = new Set();
 
+// "12345-1" or "12345" -> { num: '12345', full: '12345-1' }
+function parseSetInput(v) {
+  const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(String(v).trim());
+  return m ? { num: m[1], full: m[1] + '-' + (m[2] || '1') } : null;
+}
+
+// Ask the script for a set by number (fills name/theme/year) and, when a barcode is given, remember barcode -> set.
+// Offline or failing: keep the mapping locally and retry the bind on the next sync.
+let pendingBinds = load(LS.binds, []);
+async function bindSet(barcode, parsed) {
+  const local = { setNumber: parsed.num, name: '', theme: '', year: '' };
+  if (configured() && navigator.onLine) {
+    try {
+      const j = await api('bind', { barcode, setNumber: parsed.full });
+      const rec = { setNumber: j.setNumber, name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      if (barcode) { lookupCache[barcode] = rec; save(LS.cache, lookupCache); }
+      return { rec, found: j.found };
+    } catch (e) { lookupError = e.message; }
+  }
+  if (barcode) {
+    lookupCache[barcode] = local; save(LS.cache, lookupCache);
+    if (configured()) { pendingBinds.push({ barcode, setNumber: parsed.full }); save(LS.binds, pendingBinds); }
+  }
+  return { rec: local, found: false, queued: true };
+}
+
 let syncing = false;
 async function sync() {
   if (!configured() || !navigator.onLine || syncing) return;
   syncing = true;
   try {
+    for (const b of [...pendingBinds]) { // set numbers typed while offline
+      const j = await api('bind', { barcode: b.barcode, setNumber: b.setNumber });
+      const rec = { setNumber: j.setNumber, name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      lookupCache[b.barcode] = rec; save(LS.cache, lookupCache);
+      scans.filter(s => s.barcode === b.barcode && !s.name).forEach(s => Object.assign(s, { name: rec.name, theme: rec.theme, year: rec.year, synced: false }));
+      pendingBinds = pendingBinds.filter(x => x !== b); save(LS.binds, pendingBinds);
+    }
     for (const s of scans.filter(s => s.status === 'needs' && s.barcode)) { // retry failed lookups
       const info = await lookup(s.barcode);
       if (info) Object.assign(s, { setNumber: info.setNumber, name: info.name, theme: info.theme || '', year: info.year || '', status: 'matched', synced: false });
@@ -75,13 +109,30 @@ setInterval(sync, 30000);
 function ask(text) {
   return new Promise(res => {
     $('dlgText').textContent = text; $('dlg').hidden = false;
-    const done = v => { $('dlg').hidden = true; $('dlgYes').onclick = $('dlgNo').onclick = null; res(v); };
+    const done = v => { $('dlg').hidden = true; $('dlgYes').onclick = $('dlgNo').onclick = null; lastAt = Date.now(); res(v); };
     $('dlgYes').onclick = () => done(true);
     $('dlgNo').onclick = () => done(false);
   });
 }
 const resumeCam = () => { if (video.srcObject && video.paused) video.play().catch(() => {}); };
 document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeCam(); });
+
+// Numeric-keypad prompt for a set number. Resolves to parseSetInput's result, or null if skipped.
+function askSetNumber(text) {
+  return new Promise(res => {
+    $('dlgSetText').textContent = text; $('dlgSetErr').textContent = ''; $('dlgSetInput').value = '';
+    $('dlgSet').hidden = false;
+    setTimeout(() => $('dlgSetInput').focus(), 60); // iOS may need one tap on the field to raise the keypad
+    const done = v => { $('dlgSet').hidden = true; $('dlgSetForm').onsubmit = null; $('dlgSetSkip').onclick = null; lastAt = Date.now(); res(v); };
+    $('dlgSetForm').onsubmit = e => {
+      e.preventDefault();
+      const p = parseSetInput($('dlgSetInput').value);
+      if (!p) { $('dlgSetErr').textContent = 'Enter a set number like 75192 or 75192-1'; return; }
+      done(p);
+    };
+    $('dlgSetSkip').onclick = () => done(null);
+  });
+}
 
 // ---------- feedback ----------
 let audioCtx;
@@ -98,10 +149,26 @@ function beep() {
 const say = t => { $('msg').textContent = t; };
 
 // ---------- adding scans ----------
-const handleBarcode = barcode => addEntry({ barcode }); // step 2 swaps this for the lookup-miss prompt
-async function addEntry({ barcode = '', setNumber = '' }) {
-  let info = null;
-  if (barcode && !setNumber) { say('Looking up ' + barcode + '...'); lookupError = ''; info = await lookup(barcode); }
+// A scanned/typed barcode: cache or Brickset first; on a miss, ask for the set number right away.
+async function handleBarcode(barcode) {
+  say('Looking up ' + barcode + '...'); lookupError = '';
+  let info = await lookup(barcode);
+  if (!info) {
+    const why = lookupError ? ` (lookup error: ${lookupError})` : '';
+    const parsed = await askSetNumber(`Barcode ${barcode} isn't in Brickset${why}. What's the set number?`);
+    if (parsed) {
+      say('Looking up set ' + parsed.full + '...');
+      const r = await bindSet(barcode, parsed);
+      info = r.rec;
+      bindNote = r.found ? '' : r.queued ? ' (saved locally, will sync)' : ' (set not found in Brickset, saved your number)';
+    }
+  }
+  return addEntry({ barcode, info });
+}
+let bindNote = '';
+
+async function addEntry({ barcode = '', setNumber = '', info = null }) {
+  if (!info && barcode && !setNumber) { say('Looking up ' + barcode + '...'); lookupError = ''; info = await lookup(barcode); }
   if (info) setNumber = info.setNumber;
 
   // duplicate: same set (or same unresolved barcode) in the same destination
@@ -123,8 +190,9 @@ async function addEntry({ barcode = '', setNumber = '' }) {
   });
   clearOneOffFields();
   save(LS.scans, scans); render(); sync();
-  say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}`
+  say(setNumber ? `Added set ${setNumber}${info?.name ? ' - ' + info.name : ''}${bindNote}`
     : `Saved barcode ${barcode} - needs set number` + (lookupError ? ` (lookup error: ${lookupError})` : configured() && navigator.onLine ? ' (not found in Brickset)' : ''));
+  bindNote = '';
 }
 
 // ---------- scanning ----------
@@ -192,7 +260,7 @@ async function scanOnce(source = video, sw = video.videoWidth, sh = video.videoH
 async function scanLoop() {
   if (!loopOn) return;
   const t0 = performance.now();
-  if (video.videoWidth && $('dlg').hidden && !document.hidden) {
+  if (video.videoWidth && $('dlg').hidden && $('dlgSet').hidden && !document.hidden) {
     const text = await scanOnce();
     if (text) onCode(text);
   }
@@ -337,10 +405,12 @@ $('manual').onsubmit = e => {
   $('manualInput').value = '';
   if (/^\d{12,13}$/.test(v)) {
     if (!validBarcode(v)) { say('That barcode has a bad check digit - retype it.'); return; }
-    addEntry({ barcode: normBarcode(v) });
-  } else if (/^\d{4,6}(-\d)?$/.test(v)) {
-    addEntry({ setNumber: v.replace(/-\d$/, '') });
-  } else say('Enter a 4-6 digit set number or a 12/13 digit barcode.');
+    handleBarcode(normBarcode(v));
+  } else if (parseSetInput(v)) {
+    const p = parseSetInput(v);
+    say('Looking up set ' + p.full + '...');
+    bindSet('', p).then(r => addEntry({ setNumber: r.rec.setNumber, info: r.rec }));
+  } else say('Enter a set number (75192 or 75192-1) or a 12/13 digit barcode.');
 };
 
 $('undoBtn').onclick = () => {
@@ -352,13 +422,16 @@ $('undoBtn').onclick = () => {
   say(`Removed ${last.setNumber || last.barcode}`);
 };
 
-function fixSetNumber(s) {
-  const v = prompt(`Set number for barcode ${s.barcode}?`, '');
-  resumeCam();
-  if (!v || !/^\d{4,6}$/.test(v.trim())) return;
-  s.setNumber = v.trim(); s.status = 'matched'; s.synced = false;
-  if (s.barcode) { lookupCache[s.barcode] = { setNumber: s.setNumber, name: s.name, year: s.year }; save(LS.cache, lookupCache); }
+// Tap a "needs set number" row to fix it: same keypad prompt, same Brickset-by-number lookup and cache save.
+async function fixSetNumber(s) {
+  const parsed = await askSetNumber(s.barcode ? `Set number for barcode ${s.barcode}?` : 'Set number for this scan?');
+  if (!parsed) return;
+  say('Looking up set ' + parsed.full + '...');
+  const r = await bindSet(s.barcode, parsed);
+  const same = scans.filter(x => x === s || (x.status === 'needs' && s.barcode && x.barcode === s.barcode));
+  same.forEach(x => Object.assign(x, { setNumber: r.rec.setNumber, name: r.rec.name, theme: r.rec.theme, year: r.rec.year, status: 'matched', synced: false }));
   save(LS.scans, scans); render(); sync();
+  say(`Set ${r.rec.setNumber}${r.rec.name ? ' - ' + r.rec.name : ''} saved` + (same.length > 1 ? ` (fixed ${same.length} rows)` : ''));
 }
 
 function render() {
@@ -369,13 +442,13 @@ function render() {
     const t = document.createElement('div'); t.className = 't';
     t.textContent = s.setNumber ? `${s.setNumber}${s.name ? ' ' + s.name : ''} x${s.qty}` : `? x${s.qty}`;
     const sub = document.createElement('div'); sub.className = 's';
-    sub.textContent = `${s.dest} - ${s.barcode || 'manual'} - ${new Date(s.ts).toLocaleTimeString()}`;
+    sub.textContent = `${s.dest} - ${s.barcode || 'manual'} - ${new Date(s.ts).toLocaleTimeString()}` + (s.status === 'needs' ? ' - tap to fix' : '');
     left.append(t, sub);
     const b = document.createElement('span');
     b.className = 'badge ' + s.status;
     b.textContent = s.status === 'needs' ? 'needs set number' : s.status;
     li.append(left, b);
-    if (s.status === 'needs') li.onclick = () => fixSetNumber(s);
+    if (s.status === 'needs') { li.classList.add('fix'); li.onclick = () => fixSetNumber(s); }
     ul.append(li);
   });
   $('undoBtn').disabled = !scans.length;

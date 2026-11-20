@@ -57,6 +57,15 @@
     <button id="dlgNo" class="ghost">New row</button>
   </div>
 </div>
+<div id="dlgSet" class="dlg" hidden>
+  <form id="dlgSetForm" class="box">
+    <p id="dlgSetText"></p>
+    <input id="dlgSetInput" type="text" inputmode="numeric" autocomplete="off" enterkeyhint="done" placeholder="Set number, e.g. 75192">
+    <p id="dlgSetErr" class="err"></p>
+    <button type="submit">Save set number</button>
+    <button type="button" id="dlgSetSkip" class="ghost">Skip - save as needs set number</button>
+  </form>
+</div>
 <script src="vendor/zxing.min.js"></script>
 <script src="app.js"></script>
 </body>

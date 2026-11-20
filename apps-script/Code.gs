@@ -7,6 +7,7 @@
  *
  * Requests are POSTed as text/plain JSON: { token, action, ... }
  *   lookup  { barcode }          -> { ok, found, setNumber, name, theme, year }
+ *   bind    { barcode?, setNumber } -> same shape; looks the set up by number and caches barcode -> set
  *   upsert  { scans: [...] }     -> { ok, count }   (insert, or update by Scan ID)
  *   remove  { ids: [...] }       -> { ok, count }
  */
@@ -30,7 +31,9 @@ function doPost(e) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    if (req.action === 'lookup') return out(lookup(String(req.barcode || ''), (props.getProperty('BRICKSET_KEY') || '').trim()));
+    const bsKey = (props.getProperty('BRICKSET_KEY') || '').trim();
+    if (req.action === 'lookup') return out(lookup(String(req.barcode || ''), bsKey));
+    if (req.action === 'bind') return out(bindSet(String(req.barcode || ''), String(req.setNumber || ''), bsKey));
     if (req.action === 'upsert') return out(upsert(req.scans || []));
     if (req.action === 'remove') return out(remove(req.ids || []));
     return out({ ok: false, error: 'unknown action' });
@@ -73,20 +76,51 @@ function lookup(barcode, key) {
   for (const q of tries) {
     const set = bricksetQuery(q, key);
     if (set) {
-      const rec = { setNumber: set.number, name: set.name, theme: set.theme || '', year: set.year || '' };
-      const fmt = cache.getRange(cache.getLastRow() + 1, 1, 1, 6);
-      fmt.setNumberFormat('@');
-      fmt.setValues([[barcode, rec.setNumber, rec.name, rec.theme, String(rec.year), new Date().toISOString()]]);
+      const rec = recFromSet(set);
+      cachePut(barcode, rec);
       return Object.assign({ ok: true, found: true }, rec);
     }
   }
   return { ok: true, found: false };
 }
 
-function bricksetQuery(q, key) {
+function recFromSet(set) {
+  return { setNumber: set.number, name: set.name, theme: set.theme || '', year: set.year || '' };
+}
+
+// Insert or update one barcode -> set row in the Lookup Cache tab.
+function cachePut(barcode, rec) {
+  const cache = sheet(CACHE, ['Barcode', 'Set #', 'Set Name', 'Theme', 'Year', 'Cached At']);
+  const last = cache.getLastRow();
+  const codes = last > 1 ? cache.getRange(2, 1, last - 1, 1).getDisplayValues().map(r => r[0]) : [];
+  const i = codes.indexOf(barcode);
+  const row = i >= 0 ? i + 2 : last + 1;
+  const rng = cache.getRange(row, 1, 1, 6);
+  rng.setNumberFormat('@');
+  rng.setValues([[barcode, String(rec.setNumber), rec.name || '', rec.theme || '', String(rec.year || ''), new Date().toISOString()]]);
+}
+
+// The user typed a set number for a barcode Brickset didn't know (or just a set number to fill in details).
+// Look the set up by number, and remember barcode -> set even if Brickset can't find the set.
+function bindSet(barcode, setInput, key) {
+  const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(setInput.trim());
+  if (!m) return { ok: false, error: 'bad set number' };
+  const full = m[1] + '-' + (m[2] || '1');
+  let rec = null;
+  if (key) {
+    const sets = bricksetGetSets({ setNumber: full }, key);
+    const hit = sets.find(s => String(s.number) === m[1]) || null;
+    if (hit) rec = recFromSet(hit);
+  }
+  const result = rec || { setNumber: m[1], name: '', theme: '', year: '' };
+  if (/^\d{12,13}$/.test(barcode)) cachePut(barcode, result);
+  return Object.assign({ ok: true, found: !!rec }, result);
+}
+
+function bricksetGetSets(params, key) {
   // Built by hand: Brickset 500s if userHash is missing, and an object payload drops empty values.
   const body = 'apiKey=' + encodeURIComponent(key) + '&userHash=' +
-    '&params=' + encodeURIComponent(JSON.stringify({ query: q, pageSize: 5 }));
+    '&params=' + encodeURIComponent(JSON.stringify(params));
   const res = UrlFetchApp.fetch('https://brickset.com/api/v3.asmx/getSets', {
     method: 'post',
     contentType: 'application/x-www-form-urlencoded',
@@ -97,8 +131,13 @@ function bricksetQuery(q, key) {
   let j;
   try { j = JSON.parse(text); } catch (e) { throw new Error('Brickset HTTP ' + res.getResponseCode() + ': ' + text.slice(0, 120)); }
   if (j.status !== 'success') throw new Error('Brickset: ' + (j.message || j.status));
+  return j.sets || [];
+}
+
+function bricksetQuery(q, key) {
+  const sets = bricksetGetSets({ query: q, pageSize: 5 }, key);
   // Only accept a set whose stored barcode really equals the query, so a text match can't mislabel a scan.
-  const hit = (j.sets || []).find(s => s.barcode && (s.barcode.EAN === q || s.barcode.UPC === q));
+  const hit = sets.find(s => s.barcode && (s.barcode.EAN === q || s.barcode.UPC === q));
   return hit || null;
 }
 
