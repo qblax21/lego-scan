@@ -27,10 +27,11 @@
 
   <div class="cam">
     <video id="video" playsinline muted></video>
-    <div class="reticle"></div>
+    <div class="reticle"><i></i><i></i><i></i><i></i></div>
     <div id="flash" class="flash"></div>
     <button id="startBtn" class="start">Tap to start camera</button>
   </div>
+  <div id="dbg" class="dbg" hidden></div>
   <p id="msg" class="msg">Point at a box barcode</p>
 
   <form id="manual" class="manual">
@@ -46,7 +47,7 @@
 
   <div class="foot">
     <span id="net"></span>
-    <span><button id="cfgBtn" class="ghost">Sheets</button> <button id="csvBtn" class="ghost">CSV</button></span>
+    <span><button id="dbgBtn" class="ghost">Debug</button> <button id="cfgBtn" class="ghost">Sheets</button> <button id="csvBtn" class="ghost">CSV</button></span>
   </div>
 </main>
 <div id="dlg" class="dlg" hidden>

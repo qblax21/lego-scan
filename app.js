@@ -98,6 +98,7 @@ function beep() {
 const say = t => { $('msg').textContent = t; };
 
 // ---------- adding scans ----------
+const handleBarcode = barcode => addEntry({ barcode }); // step 2 swaps this for the lookup-miss prompt
 async function addEntry({ barcode = '', setNumber = '' }) {
   let info = null;
   if (barcode && !setNumber) { say('Looking up ' + barcode + '...'); lookupError = ''; info = await lookup(barcode); }
@@ -128,36 +129,91 @@ async function addEntry({ barcode = '', setNumber = '' }) {
 
 // ---------- scanning ----------
 const video = $('video');
-const canvas = document.createElement('canvas');
-const ctx = canvas.getContext('2d', { willReadFrequently: true });
-let detector = null, zxingReader = null, lastCode = '', lastAt = 0, busy = false;
+// ZXing path (iPhone): decode only the aiming box, downscaled, instead of the full 1080p frame.
+const work = document.createElement('canvas');
+const wctx = work.getContext('2d', { willReadFrequently: true });
+let detector = null, fastReader = null, hardReader = null, lastCode = '', lastAt = 0, loopOn = false, frameNo = 0;
+const DECODE_W = 640;   // width the crop is scaled to before decoding
+const HARD_EVERY = 4;   // run the slow TRY_HARDER pass only on every Nth frame (and only if the fast pass missed)
+const LOOP_MS = 90;     // minimum time between frames; the next frame is scheduled only after the last decode ends
+const stats = { ms: [], frames: [], scans: [], hardTries: 0, hardHits: 0 };
 
 function onCode(raw) {
   const now = Date.now();
   if (raw === lastCode && now - lastAt < 2500) { lastAt = now; return; } // duplicate read
   if (!validBarcode(raw)) return;
   lastCode = raw; lastAt = now;
+  stats.scans.push(now);
   beep();
-  addEntry({ barcode: normBarcode(raw) });
+  handleBarcode(normBarcode(raw));
 }
 
-async function tick() {
-  if (!video.videoWidth || busy || !$('dlg').hidden) return;
-  busy = true;
-  try {
-    if (detector) {
-      const r = await detector.detect(video);
-      if (r[0]) onCode(r[0].rawValue);
-    } else {
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0);
-      const src = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
-      const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
-      try { onCode(zxingReader.decode(bmp).getText()); } catch (e) { /* NotFound each empty frame */ }
-    }
-  } catch {}
-  busy = false;
+// Part of the video frame that sits under the on-screen aiming box (video is shown with object-fit: cover).
+function cropRect(sw, sh) {
+  const cam = document.querySelector('.cam'), ret = document.querySelector('.reticle');
+  const cr = cam.getBoundingClientRect(), rr = ret.getBoundingClientRect();
+  if (!cr.width || !rr.width) return { x: sw * 0.1, y: sh * 0.3, w: sw * 0.8, h: sh * 0.4 };
+  const scale = Math.max(cr.width / sw, cr.height / sh);
+  const offX = (cr.width - sw * scale) / 2, offY = (cr.height - sh * scale) / 2;
+  let x = (rr.left - cr.left - offX) / scale, y = (rr.top - cr.top - offY) / scale;
+  let w = rr.width / scale, h = rr.height / scale;
+  x = Math.max(0, x); y = Math.max(0, y); w = Math.min(w, sw - x); h = Math.min(h, sh - y);
+  return { x, y, w, h };
 }
+
+function zxingDecode(source, sw, sh, hard) {
+  const r = cropRect(sw, sh), k = Math.min(1, DECODE_W / r.w);
+  work.width = Math.max(1, Math.round(r.w * k)); work.height = Math.max(1, Math.round(r.h * k));
+  wctx.drawImage(source, r.x, r.y, r.w, r.h, 0, 0, work.width, work.height);
+  const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(work)));
+  return (hard ? hardReader : fastReader).decode(bmp).getText();
+}
+
+// One attempt on the current frame. Returns the decoded text or ''.
+async function scanOnce(source = video, sw = video.videoWidth, sh = video.videoHeight) {
+  frameNo++;
+  const t0 = performance.now();
+  let text = '';
+  if (detector) {
+    try { const r = await detector.detect(source); if (r[0]) text = r[0].rawValue; } catch {}
+  } else {
+    try { text = zxingDecode(source, sw, sh, false); } catch { /* NotFound on empty frames */ }
+    if (!text && frameNo % HARD_EVERY === 0) {
+      stats.hardTries++;
+      try { text = zxingDecode(source, sw, sh, true); stats.hardHits++; } catch {}
+    }
+  }
+  const t1 = performance.now();
+  stats.ms.push(t1 - t0); if (stats.ms.length > 30) stats.ms.shift();
+  stats.frames.push(t1);
+  return text;
+}
+
+async function scanLoop() {
+  if (!loopOn) return;
+  const t0 = performance.now();
+  if (video.videoWidth && $('dlg').hidden && !document.hidden) {
+    const text = await scanOnce();
+    if (text) onCode(text);
+  }
+  setTimeout(scanLoop, Math.max(20, LOOP_MS - (performance.now() - t0))); // never overlaps itself
+}
+
+// ---------- debug readout (toggle with the Debug button) ----------
+let debugOn = load('legoscan.debug', false);
+function renderDebug() {
+  $('dbg').hidden = !debugOn;
+  $('dbgBtn').textContent = debugOn ? 'Debug on' : 'Debug';
+  if (!debugOn) return;
+  const now = performance.now(), wall = Date.now();
+  stats.frames = stats.frames.filter(t => now - t < 5000);
+  stats.scans = stats.scans.filter(t => wall - t < 60000);
+  const avg = stats.ms.length ? stats.ms.reduce((a, b) => a + b, 0) / stats.ms.length : 0;
+  $('dbg').textContent = `${detector ? 'native' : 'zxing'} | ${avg.toFixed(0)} ms/decode | ${(stats.frames.length / 5).toFixed(1)} fps | ` +
+    `${stats.scans.length} scans/min` + (detector ? '' : ` | hard ${stats.hardHits}/${stats.hardTries}`);
+}
+$('dbgBtn').onclick = () => { debugOn = !debugOn; save('legoscan.debug', debugOn); renderDebug(); };
+setInterval(renderDebug, 500);
 
 async function startCamera() {
   $('startBtn').hidden = true;
@@ -182,14 +238,19 @@ async function startCamera() {
   if ('BarcodeDetector' in window) {
     try { detector = new BarcodeDetector({ formats: ['ean_13', 'upc_a'] }); } catch { detector = null; }
   }
-  if (!detector) {
-    const hints = new Map();
-    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.UPC_A]);
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    zxingReader = new ZXing.MultiFormatReader(); zxingReader.setHints(hints);
-  }
+  if (!detector) makeReaders();
   say('Point at a box barcode');
-  setInterval(tick, 150);
+  loopOn = true; scanLoop();
+}
+function makeReaders() {
+  const formats = [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.UPC_A];
+  const mk = hard => {
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+    if (hard) hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    const r = new ZXing.MultiFormatReader(); r.setHints(hints); return r;
+  };
+  fastReader = mk(false); hardReader = mk(true);
 }
 $('startBtn').onclick = startCamera;
 
