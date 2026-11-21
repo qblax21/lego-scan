@@ -29,6 +29,14 @@ The scanner works without this. To connect your own sheet:
 3. Deploy -> New deployment -> type "Web app" -> Execute as: Me -> Who has access: Anyone -> Deploy.
    Authorize when asked, then copy the web app URL.
 4. In the app tap "Sheets", paste the URL, then the secret. Both stay on your phone only.
+**Whenever `Code.gs` changes you must redeploy it as a new version:** paste the new code, then Deploy -> Manage deployments ->
+pencil -> Version: New version -> Deploy (the web app URL stays the same). Saving alone does not update the live web app.
+An out-of-date deployment shows up in the app's status line as "Sync problem: ... unknown action (redeploy Code.gs ...)".
+Sync steps are independent: a failing lookup, bind or recount never blocks uploading scans, and a sync problem stays on
+screen until that step next succeeds (tap the status line to retry now).
+Rows that have a set number but no name are retried against Brickset by number: once per set per day, deduped, never for a
+set Brickset said it doesn't have, and not at all once today's count reaches 80/100.
+
 The app also pulls the whole Lookup Cache on launch and after syncs, so known barcodes match offline and cost no Brickset call.
 The footer shows "Brickset lookups used today: N/100" (the script's own count, UTC day).
 New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".

@@ -53,6 +53,8 @@ h2{font-size:16px;margin:0;color:var(--mut);font-weight:600}
 .rc{display:flex;align-items:center;gap:10px}
 .rc b{min-width:2.2em;text-align:center;font-size:26px}
 .rc button{min-width:52px;padding:0}
+#net{flex:1;min-width:0;padding-right:8px}
+#net.err{color:var(--warn);font-weight:600}
 .bs{margin:6px 0;font-size:12px;color:var(--mut);text-align:right}
 .bs.warn{color:var(--warn)}
 .foot{display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:14px}

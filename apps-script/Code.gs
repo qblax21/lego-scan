@@ -7,7 +7,8 @@
  *
  * Requests are POSTed as text/plain JSON: { token, action, ... }
  *   lookup  { barcode }          -> { ok, found, setNumber, name, theme, year }
- *   bind    { barcode?, setNumber } -> same shape; looks the set up by number and caches barcode -> set
+ *   bind    { barcode?, setNumber } -> same shape; looks the set up by number and caches barcode -> set.
+ *           Brickset errors are caught: { ok:true, found:false, error } (the barcode -> set mapping is still saved).
  *   cache   {}                   -> { ok, rows: [{ barcode, setNumber, name, theme, year }] }  (all Lookup Cache rows)
  *   recount      { items: [{ setNumber, name, counted, ts }] } -> { ok, count }  (upsert by Set # in the Recount tab; counted <= 0 removes)
  *   recountReset {}              -> { ok }  (clears the Recount tab's rows; never touches the inventory tabs)
@@ -102,8 +103,10 @@ function recFromSet(set) {
 function cachePut(barcode, rec) {
   const cache = sheet(CACHE, ['Barcode', 'Set #', 'Set Name', 'Theme', 'Year', 'Cached At']);
   const last = cache.getLastRow();
-  const codes = last > 1 ? cache.getRange(2, 1, last - 1, 1).getDisplayValues().map(r => r[0]) : [];
-  const i = codes.indexOf(barcode);
+  const existing = last > 1 ? cache.getRange(2, 1, last - 1, 3).getDisplayValues() : [];
+  const i = existing.findIndex(r => r[0] === barcode);
+  // A nameless result (Brickset failed or doesn't know the set) must not wipe a good row for the same set.
+  if (i >= 0 && !rec.name && existing[i][2] && existing[i][1] === String(rec.setNumber)) return;
   const row = i >= 0 ? i + 2 : last + 1;
   const rng = cache.getRange(row, 1, 1, 6);
   rng.setNumberFormat('@');
@@ -116,15 +119,22 @@ function bindSet(barcode, setInput, key) {
   const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(setInput.trim());
   if (!m) return { ok: false, error: 'bad set number' };
   const full = m[1] + '-' + (m[2] || '1');
-  let rec = null;
-  if (key) {
-    const sets = bricksetGetSets({ setNumber: full }, key);
-    const hit = sets.find(s => String(s.number) === m[1]) || null;
-    if (hit) rec = recFromSet(hit);
+  let rec = null, error = '';
+  if (!key) {
+    error = 'BRICKSET_KEY not set';
+  } else {
+    try { // a Brickset error or daily-limit failure must not fail the request: the user's mapping is still saved
+      const sets = bricksetGetSets({ setNumber: full }, key);
+      const hit = sets.find(s => String(s.number) === m[1]) || null;
+      if (hit) rec = recFromSet(hit);
+    } catch (e) { error = String((e && e.message) || e); }
   }
   const result = rec || { setNumber: m[1], name: '', theme: '', year: '' };
   if (/^\d{12,13}$/.test(barcode)) cachePut(barcode, result);
-  return Object.assign({ ok: true, found: !!rec }, result);
+  // found:false with no error means Brickset really doesn't have this set; with an error it is only "unknown right now".
+  const res = Object.assign({ ok: true, found: !!rec }, result);
+  if (error) res.error = error;
+  return res;
 }
 
 // ---------- Brickset daily call counter (the key allows about 100 getSets calls a day) ----------

@@ -6,7 +6,7 @@ const $ = id => document.getElementById(id);
 const LS = { scans: 'legoscan.scans', dest: 'legoscan.dest', cache: 'legoscan.lookupCache',
   cfg: 'legoscan.cfg', removals: 'legoscan.removals', cond: 'legoscan.cond', kept: 'legoscan.kept',
   binds: 'legoscan.pendingBinds', bs: 'legoscan.bsUsed', mode: 'legoscan.mode', recount: 'legoscan.recount',
-  rreset: 'legoscan.recountReset' };
+  rreset: 'legoscan.recountReset', syncErr: 'legoscan.syncErr', retry: 'legoscan.setRetry' };
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -43,6 +43,32 @@ function renderBs() {
   el.textContent = `Brickset lookups used today: ${used}/${BS_LIMIT}`;
   el.classList.toggle('warn', used >= BS_LIMIT * 0.8);
 }
+
+// Background retries stop at this many Brickset calls a day, leaving headroom for real scans.
+const BS_RETRY_CAP = 80;
+const bsUsedToday = () => (bsInfo && bsInfo.day === utcDay() ? bsInfo.used : 0);
+const bsBudget = () => bsUsedToday() < BS_RETRY_CAP;
+
+// Per-set retry bookkeeping: miss = Brickset definitively doesn't have the set (never asked again);
+// tried = last day we asked, so each set (or barcode) is retried at most once a day.
+let setRetry = load(LS.retry, { miss: {}, tried: {} });
+const triedToday = key => setRetry.tried[key] === utcDay();
+function markTried(key) {
+  const today = utcDay();
+  Object.keys(setRetry.tried).forEach(k => { if (setRetry.tried[k] !== today) delete setRetry.tried[k]; });
+  setRetry.tried[key] = today; save(LS.retry, setRetry);
+}
+function markMiss(setNum) { setRetry.miss[setNum] = utcDay(); save(LS.retry, setRetry); }
+
+// Sync problems stay on screen until the step that failed next succeeds (render() never overwrites them).
+let syncErr = load(LS.syncErr, {}); // step -> message
+const syncErrText = () => Object.entries(syncErr).map(([k, v]) => `${k}: ${v}`).join('; ');
+function setStepErr(step, e) {
+  let m = (e && e.message) || String(e);
+  if (/unknown action/i.test(m)) m += ' (redeploy Code.gs as a new version)';
+  syncErr[step] = m; save(LS.syncErr, syncErr); render();
+}
+function clearStepErr(step) { if (step in syncErr) { delete syncErr[step]; save(LS.syncErr, syncErr); render(); } }
 
 async function api(action, payload) {
   const r = await fetch(cfg.url, { method: 'POST', redirect: 'follow',
@@ -97,9 +123,11 @@ async function bindSet(barcode, parsed) {
   if (configured() && navigator.onLine) {
     try {
       const j = await api('bind', { barcode, setNumber: parsed.full });
-      const rec = { setNumber: j.setNumber, name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      const rec = { setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' };
       if (barcode) { lookupCache[barcode] = rec; save(LS.cache, lookupCache); }
-      return { rec, found: j.found };
+      if (!j.found && !j.error) markMiss(rec.setNumber); // Brickset really doesn't have it: stop asking
+      // j.error = Brickset trouble inside the script; the mapping is saved there, the name is filled in by a later retry
+      return { rec, found: j.found, error: j.error };
     } catch (e) { lookupError = e.message; }
   }
   if (barcode) {
@@ -109,44 +137,131 @@ async function bindSet(barcode, parsed) {
   return { rec: local, found: false, queued: true };
 }
 
+// Copy a found set's name/theme/year onto every row, tally and cached barcode that has that set number but no name.
+function fillNames(rec) {
+  if (!rec.name) return;
+  scans.filter(s => s.setNumber === rec.setNumber && !s.name)
+    .forEach(s => Object.assign(s, { name: rec.name, theme: rec.theme, year: rec.year, synced: false }));
+  Object.values(recount).filter(x => x.setNumber === rec.setNumber && !x.name)
+    .forEach(x => { x.name = rec.name; x.synced = false; });
+  Object.keys(lookupCache).forEach(k => {
+    const c = lookupCache[k];
+    if (c.setNumber === rec.setNumber && !c.name) lookupCache[k] = { ...c, name: rec.name, theme: rec.theme, year: rec.year };
+  });
+  save(LS.scans, scans); save(LS.recount, recount); save(LS.cache, lookupCache);
+}
+
+// Set numbers typed (with a barcode) while offline or while the script was failing. A failure keeps the bind queued and
+// backs off; it never throws, so it can't block the upload steps after it.
+async function syncBinds() {
+  let tried = false, failed = null;
+  for (const b of [...pendingBinds]) {
+    if (b.next && b.next > Date.now()) continue;
+    if (!bsBudget()) break;
+    tried = true;
+    try {
+      const j = await api('bind', { barcode: b.barcode, setNumber: b.setNumber });
+      const rec = { setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      markTried(rec.setNumber);
+      if (j.error) { const e = new Error(j.error); e.brickset = true; throw e; }
+      lookupCache[b.barcode] = rec; save(LS.cache, lookupCache);
+      if (!j.found) markMiss(rec.setNumber);
+      fillNames(rec);
+      pendingBinds = pendingBinds.filter(x => x !== b); save(LS.binds, pendingBinds);
+    } catch (e) {
+      b.tries = (b.tries || 0) + 1;
+      // Brickset trouble already cost a call: wait 6h. Network / old-script failures cost none: 2, 4, 8... min up to 1h.
+      b.next = Date.now() + (e.brickset ? 6 * 3600e3 : Math.min(3600e3, 60e3 * 2 ** b.tries));
+      save(LS.binds, pendingBinds); failed = e;
+    }
+  }
+  if (failed) setStepErr('bind', failed); else if (tried) clearStepErr('bind');
+  return tried;
+}
+
+// Rows with a set number but no name (typed while offline, or Brickset missed): ask Brickset by number.
+// One call per set (deduped), each set at most once a day, never a set Brickset said it doesn't have,
+// and none once today's count reaches BS_RETRY_CAP.
+async function syncNames() {
+  if (syncErr.bind || (setRetry.cool || 0) > Date.now()) return false; // the bind action is failing / cooling off: don't pile on
+  const sets = [...new Set(scans.filter(s => s.setNumber && !s.name).map(s => s.setNumber))]
+    .filter(n => !(n in setRetry.miss) && !triedToday(n));
+  let tried = false, calls = 0;
+  for (const num of sets) {
+    if (!bsBudget() || calls >= 10) break;
+    calls++; tried = true; markTried(num);
+    const barcode = (scans.find(s => s.setNumber === num && s.barcode) || {}).barcode || '';
+    try {
+      const j = await api('bind', { barcode, setNumber: num + '-1' });
+      if (j.error) throw new Error(j.error);
+      if (!j.found) { markMiss(num); continue; }
+      fillNames({ setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' });
+    } catch (e) { // keep the rows, pause this step for 15 min, try the rest tomorrow; never stops the sync
+      setRetry.cool = Date.now() + 15 * 60e3; save(LS.retry, setRetry);
+      setStepErr('names', e);
+      return tried;
+    }
+  }
+  if (tried) clearStepErr('names');
+  return tried;
+}
+
 let syncing = false;
 async function sync() {
   if (!configured() || !navigator.onLine || syncing) return;
   syncing = true;
   let didWork = false;
-  try {
-    for (const b of [...pendingBinds]) { // set numbers typed while offline
-      didWork = true;
-      const j = await api('bind', { barcode: b.barcode, setNumber: b.setNumber });
-      const rec = { setNumber: j.setNumber, name: j.name || '', theme: j.theme || '', year: j.year || '' };
-      lookupCache[b.barcode] = rec; save(LS.cache, lookupCache);
-      scans.filter(s => s.barcode === b.barcode && !s.name).forEach(s => Object.assign(s, { name: rec.name, theme: rec.theme, year: rec.year, synced: false }));
-      pendingBinds = pendingBinds.filter(x => x !== b); save(LS.binds, pendingBinds);
-    }
-    for (const s of scans.filter(s => s.status === 'needs' && s.barcode)) { // retry failed lookups
-      const info = await lookup(s.barcode);
+  // Every step is isolated: a failure is recorded (and stays on screen) but never stops the steps after it,
+  // so lookup/bind trouble can never block the upload of scans.
+  const step = async (name, fn, own) => {
+    try { if (await fn()) didWork = true; if (!own) clearStepErr(name); } catch (e) { setStepErr(name, e); }
+  };
+  await step('bind', syncBinds, true);
+  await step('names', syncNames, true);
+  await step('lookup', async () => { // retry barcodes that missed; once a day each, within the daily budget
+    let tried = false;
+    for (const s of scans.filter(s => s.status === 'needs' && s.barcode)) {
+      let info = lookupCache[s.barcode] || null; // a cache hit (e.g. fixed on another device) costs nothing
+      if (!info) {
+        if (triedToday('bc:' + s.barcode) || !bsBudget()) continue;
+        markTried('bc:' + s.barcode); tried = true;
+        info = await lookup(s.barcode);
+      }
       if (info) Object.assign(s, { setNumber: info.setNumber, name: info.name, theme: info.theme || '', year: info.year || '', status: 'matched', synced: false });
     }
-    if (removals.length) { didWork = true; await api('remove', { ids: removals }); removals = []; save(LS.removals, removals); }
-    const pending = scans.filter(s => !s.synced);
-    if (pending.length) {
-      didWork = true;
-      await api('upsert', { scans: pending });
-      pending.forEach(s => { s.synced = true; });
-    }
-    // recount tally -> Recount tab (a reset from "New recount" goes first)
-    if (recountResetPending) { didWork = true; await api('recountReset'); recountResetPending = false; save(LS.rreset, false); }
-    const rp = Object.values(recount).filter(x => !x.synced).map(x => [x, x.qty]);
+    return tried;
+  });
+  await step('remove', async () => {
+    if (!removals.length) return false;
+    const ids = [...removals];
+    await api('remove', { ids });
+    removals = removals.filter(id => !ids.includes(id)); save(LS.removals, removals);
+    return true;
+  });
+  await step('upload', async () => {
+    const pending = scans.filter(s => !s.synced).map(s => [s, s.ts, s.qty, s.name, s.setNumber]);
+    if (!pending.length) return false;
+    await api('upsert', { scans: pending.map(p => p[0]) });
+    // a row edited during the request (qty, name, set number) stays pending
+    pending.forEach(([s, ts, qty, name, num]) => { if (s.ts === ts && s.qty === qty && s.name === name && s.setNumber === num) s.synced = true; });
+    return true;
+  });
+  // recount tally -> Recount tab (a reset from "New recount" goes first)
+  await step('recount', async () => {
+    let did = false;
+    if (recountResetPending) { did = true; await api('recountReset'); recountResetPending = false; save(LS.rreset, false); }
+    const rp = Object.values(recount).filter(x => !x.synced).map(x => [x, x.qty, x.name]);
     if (rp.length) {
-      didWork = true;
+      did = true;
       await api('recount', { items: rp.map(([x, q]) => ({ setNumber: x.setNumber, name: x.name, counted: q, ts: x.ts })) });
-      rp.forEach(([x, q]) => { if (x.qty === q) x.synced = true; }); // a tap during the request stays pending
+      rp.forEach(([x, q, n]) => { if (x.qty === q && x.name === n) x.synced = true; }); // a tap during the request stays pending
       Object.keys(recount).forEach(k => { if (recount[k].qty <= 0 && recount[k].synced) delete recount[k]; });
       save(LS.recount, recount); renderRecount();
     }
-    save(LS.scans, scans); render();
-    if (didWork) await pullCache(); // after a sync that changed something, refresh the offline cache
-  } catch (e) { $('net').textContent = 'Sync failed: ' + e.message; }
+    return did;
+  });
+  save(LS.scans, scans); render();
+  if (didWork) await pullCache(); // after a sync that changed something, refresh the offline cache
   syncing = false;
 }
 setInterval(sync, 30000);
@@ -206,7 +321,7 @@ async function handleBarcode(barcode) {
       say('Looking up set ' + parsed.full + '...');
       const r = await bindSet(barcode, parsed);
       info = r.rec;
-      bindNote = r.found ? '' : r.queued ? ' (saved locally, will sync)' : ' (set not found in Brickset, saved your number)';
+      bindNote = r.found ? '' : r.queued ? ' (saved locally, will sync)' : r.error ? ' (Brickset error, name will fill in later)' : ' (set not found in Brickset, saved your number)';
     }
   }
   return addEntry({ barcode, info });
@@ -553,9 +668,13 @@ function render() {
   $('undoBtn').disabled = !scans.length;
   renderBs();
   const pending = scans.filter(s => !s.synced).length;
+  const err = syncErrText();
   $('net').textContent = `${navigator.onLine ? 'Online' : 'Offline'} - ${scans.length} scans` +
-    (configured() ? ` (${pending} waiting to sync)` : ' (Sheets not connected)');
+    (configured() ? ` (${pending} waiting to sync)` : ' (Sheets not connected)') +
+    (err ? ` - Sync problem: ${err}` : '');
+  $('net').classList.toggle('err', !!err);
 }
+$('net').onclick = () => { pendingBinds.forEach(b => { delete b.next; }); sync(); }; // tap the status line to retry now
 window.addEventListener('online', () => { render(); sync(); });
 window.addEventListener('offline', render);
 
