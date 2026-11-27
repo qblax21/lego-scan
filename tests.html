@@ -50,14 +50,21 @@ async function app({ ls = {}, handler } = {}) {
 
 // ---- run Code.gs functions with stubbed Google services ----
 let codeGs = '';
-function gas(stubs = {}) {
-  const names = Object.keys(stubs);
+// brickset(params) -> array of Brickset sets; every getSets call goes through it (queries are recorded in gas.queries).
+function gas(brickset = () => []) {
+  gas.queries = [];
+  const fetchStub = { fetch: (url, o) => {
+    const params = JSON.parse(decodeURIComponent(/params=([^&]*)/.exec(o.payload)[1]));
+    gas.queries.push(params);
+    return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ status: 'success', sets: brickset(params) }) };
+  } };
+  const names = [];
   const body = codeGs + '\n;return {' + ['SCRIPT_VERSION', 'bindSet', 'recFromSet', 'doPost', 'analyzeInventory', 'out']
     .map(n => `${n}: typeof ${n} === 'undefined' ? undefined : ${n}`).join(',') + '};';
   return new Function(...names, 'SpreadsheetApp', 'ContentService', 'PropertiesService', 'LockService', 'Utilities', 'UrlFetchApp', body)(
     ...names.map(n => stubs[n]), {}, { MimeType: { JSON: 1 }, createTextOutput: s => ({ s, setMimeType() { return this; } }) },
     { getScriptProperties: () => ({ getProperty: k => ({ SECRET: 's', BRICKSET_KEY: 'k' })[k] || null, setProperties() {} }) },
-    { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) }, { formatDate: () => '2026-01-01' }, {});
+    { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) }, { formatDate: () => '2026-01-01' }, fetchStub);
 }
 
 // ================= tests are appended below =================
@@ -142,6 +149,64 @@ async function main() {
     eq('zxing fast then TRY_HARDER logged', z.map(x => [x.path, x.pass, x.ok]), [['zxing', 'fast', false], ['zxing', 'TRY_HARDER', true]]);
     t.el('dbgBtn').click();
     eq('turning Debug off stops the test', t.ev('ST.on'), false);
+    t.done();
+  }
+
+  head('3. Variant set names');
+  {
+    // --- pure parsing ---
+    const t = await app();
+    const P = x => JSON.parse(t.ev(`JSON.stringify(parseSetInput(${JSON.stringify(x)}))`));
+    eq('75192 -> looks up -1, stored as 75192', [P('75192').full, P('75192').id], ['75192-1', '75192']);
+    eq('75192-2 -> looks up -2, stored as 75192-2', [P('75192-2').full, P('75192-2').id], ['75192-2', '75192-2']);
+    eq('75192-1 typed -> stored plain', P('75192-1').id, '75192');
+    eq('-0 is not a variant', P('75192-0'), null);
+    t.done();
+  }
+  {
+    // --- Code.gs: exact variant only ---
+    const set = (n, v, name) => ({ number: String(n), numberVariant: v, name, theme: 'Star Wars', year: 2017 });
+    let g = gas(p => [set(75192, 1, 'Millennium Falcon')]);                          // Brickset hands back -1 for a -2 request
+    let r = g.bindSet('', '75192-2', 'k');
+    check('script: -2 request that only returns -1 is NOT a match', r.found === false && r.name === '' && r.setNumber === '75192-2', r);
+    eq('script: the request asked Brickset for 75192-2', gas.queries[0].setNumber, '75192-2');
+    g = gas(p => [set(75192, 1, 'Millennium Falcon'), set(75192, 2, 'Millennium Falcon (variant)')]);
+    r = g.bindSet('', '75192-2', 'k');
+    check('script: picks the -2 set by variant', r.found && r.name === 'Millennium Falcon (variant)' && r.setNumber === '75192-2', r);
+    g = gas(p => [set(75192, 1, 'Millennium Falcon')]);
+    r = g.bindSet('', '75192', 'k');
+    check('script: no variant typed -> asks for -1 and returns plain 75192', gas.queries[0].setNumber === '75192-1' && r.found && r.setNumber === '75192', [gas.queries, r]);
+  }
+  {
+    // --- app: bind sends the exact variant, stores the full number, flags a no-match, retry uses the variant ---
+    const bindCalls = [];
+    const miss = b => { if (b.action === 'bind') { bindCalls.push(b.setNumber); return { ok: true, found: false, setNumber: '75192', name: '', theme: '', year: '' }; } };
+    const t = await app({ handler: miss });
+    t.type('75192-2');
+    await until(() => t.ev('scans.length') === 1);
+    await until(() => t.calls.some(c => c.action === 'upsert'));
+    eq('app: typing 75192-2 asks the script for 75192-2', bindCalls[0], '75192-2');
+    eq('app: stored set number keeps the variant, name blank', t.ev('[scans[0].setNumber, scans[0].name]'), ['75192-2', '']);
+    eq('app: uploaded row carries 75192-2', t.calls.find(c => c.action === 'upsert').scans[0].setNumber, '75192-2');
+    check('app: no-match is flagged on screen', /name left blank: Brickset has no set 75192-2/.test(t.el('list').textContent) && t.el('list').querySelector('li.flag'), t.el('list').textContent);
+    check('app: no-match is remembered so it is not retried', '75192-2' in t.ev('setRetry.miss'));
+    t.done();
+  }
+  {
+    const bindCalls = [];
+    const t = await app({ handler: b => { if (b.action === 'bind') { bindCalls.push(b.setNumber); return { ok: true, found: false, setNumber: '75192', name: '', theme: '', year: '' }; } },
+      ls: { 'legoscan.scans': [{ id: 'a1', barcode: '', setNumber: '75192-2', name: '', theme: '', year: '', dest: 'Personal', condition: 'Sealed', extra: {}, qty: 1, ts: 1, synced: true, status: 'saved' },
+                               { id: 'a2', barcode: '', setNumber: '10300', name: '', theme: '', year: '', dest: 'Personal', condition: 'Sealed', extra: {}, qty: 1, ts: 2, synced: true, status: 'saved' }] } });
+    await until(() => bindCalls.length >= 2);
+    check('name retry for 75192-2 looks up -2, not -1', bindCalls.includes('75192-2') && !bindCalls.includes('75192-1'), bindCalls);
+    check('name retry with no variant still defaults to -1', bindCalls.includes('10300-1'), bindCalls);
+    t.done();
+  }
+  {
+    const t = await app({ handler: b => b.action === 'bind' ? { ok: true, found: true, setNumber: '75192', name: 'Variant Name', theme: 'Star Wars', year: 2017 } : undefined });
+    t.type('75192-2');
+    await until(() => t.ev('scans.length') === 1 && t.ev('scans[0].name') === 'Variant Name');
+    eq('app: found variant gets its own name and number', t.ev('[scans[0].setNumber, scans[0].name]'), ['75192-2', 'Variant Name']);
     t.done();
   }
 

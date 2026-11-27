@@ -19,7 +19,7 @@
  *   version {}                   -> { ok, version }  (SCRIPT_VERSION; the app compares it with the version it expects)
  */
 // Bump this whenever the app/script API or behaviour changes, and bump EXPECTED_SCRIPT in app.js to match.
-const SCRIPT_VERSION = 1;
+const SCRIPT_VERSION = 2; // 2: exact set-number variants (75192-2 is looked up and returned as 75192-2, never as -1)
 const STAGING = 'Scan Staging';
 const CACHE = 'Lookup Cache';
 const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID',
@@ -99,8 +99,11 @@ function lookup(barcode, key) {
   return { ok: true, found: false };
 }
 
+// The stored set number: plain for variant 1 ("75192"), with the variant for any other ("75192-2").
+function setId(number, variant) { const v = Number(variant) || 1; return String(number) + (v > 1 ? '-' + v : ''); }
+
 function recFromSet(set) {
-  return { setNumber: set.number, name: set.name, theme: set.theme || '', year: set.year || '' };
+  return { setNumber: setId(set.number, set.numberVariant), name: set.name, theme: set.theme || '', year: set.year || '' };
 }
 
 // Insert or update one barcode -> set row in the Lookup Cache tab.
@@ -122,18 +125,21 @@ function cachePut(barcode, rec) {
 function bindSet(barcode, setInput, key) {
   const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(setInput.trim());
   if (!m) return { ok: false, error: 'bad set number' };
-  const full = m[1] + '-' + (m[2] || '1');
+  const variant = m[2] === undefined ? 1 : Number(m[2]);
+  if (!variant) return { ok: false, error: 'bad set number' };
+  const full = m[1] + '-' + variant; // the exact variant asked for; -1 only when none was typed
   let rec = null, error = '';
   if (!key) {
     error = 'BRICKSET_KEY not set';
   } else {
     try { // a Brickset error or daily-limit failure must not fail the request: the user's mapping is still saved
       const sets = bricksetGetSets({ setNumber: full }, key);
-      const hit = sets.find(s => String(s.number) === m[1]) || null;
+      // Only the exact variant counts. If Brickset answers with a different variant (e.g. -1 for a -2 request) it is no match.
+      const hit = sets.find(s => String(s.number) === m[1] && (Number(s.numberVariant) || 1) === variant) || null;
       if (hit) rec = recFromSet(hit);
     } catch (e) { error = String((e && e.message) || e); }
   }
-  const result = rec || { setNumber: m[1], name: '', theme: '', year: '' };
+  const result = rec || { setNumber: setId(m[1], variant), name: '', theme: '', year: '' };
   if (/^\d{12,13}$/.test(barcode)) cachePut(barcode, result);
   // found:false with no error means Brickset really doesn't have this set; with an error it is only "unknown right now".
   const res = Object.assign({ ok: true, found: !!rec }, result);

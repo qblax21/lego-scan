@@ -84,7 +84,7 @@ async function api(action, payload) {
 // APP_VERSION matches the service worker cache number (lego-scan-vN). EXPECTED_SCRIPT is the lowest SCRIPT_VERSION in
 // Code.gs this app can work with; bump it together with SCRIPT_VERSION whenever the script's API or behaviour changes.
 const APP_VERSION = 15;
-const EXPECTED_SCRIPT = 1;
+const EXPECTED_SCRIPT = 2;
 const SCRIPT_OLD_MSG = 'Sheet script is out of date. In the script editor: Deploy > Manage deployments > New version.';
 let scriptInfo = { state: 'unchecked', version: null, at: 0, tried: 0 }; // state: unchecked | ok | old | missing | unknown
 async function checkScript(force) {
@@ -145,21 +145,25 @@ async function lookup(barcode) {
 let lookupError = '';
 const notFound = new Set();
 
-// "12345-1" or "12345" -> { num: '12345', full: '12345-1' }
+// "12345", "12345-1" or "12345-2". full = the exact Brickset number to look up (no variant typed -> -1).
+// id = what we store and show: the plain number for variant 1, "12345-2" for any other variant, so a variant set keeps its variant.
 function parseSetInput(v) {
   const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(String(v).trim());
-  return m ? { num: m[1], full: m[1] + '-' + (m[2] || '1') } : null;
+  if (!m) return null;
+  const variant = m[2] === undefined ? 1 : Number(m[2]);
+  if (!variant) return null;
+  return { num: m[1], variant, full: m[1] + '-' + variant, id: variant > 1 ? m[1] + '-' + variant : m[1] };
 }
 
 // Ask the script for a set by number (fills name/theme/year) and, when a barcode is given, remember barcode -> set.
 // Offline or failing: keep the mapping locally and retry the bind on the next sync.
 let pendingBinds = load(LS.binds, []);
 async function bindSet(barcode, parsed) {
-  const local = { setNumber: parsed.num, name: '', theme: '', year: '' };
+  const local = { setNumber: parsed.id, name: '', theme: '', year: '' };
   if (configured() && navigator.onLine) {
     try {
       const j = await api('bind', { barcode, setNumber: parsed.full });
-      const rec = { setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      const rec = { setNumber: parsed.id, name: j.name || '', theme: j.theme || '', year: j.year || '' }; // what was typed, variant included
       if (barcode) { lookupCache[barcode] = rec; save(LS.cache, lookupCache); }
       if (!j.found && !j.error) markMiss(rec.setNumber); // Brickset really doesn't have it: stop asking
       // j.error = Brickset trouble inside the script; the mapping is saved there, the name is filled in by a later retry
@@ -197,7 +201,7 @@ async function syncBinds() {
     tried = true;
     try {
       const j = await api('bind', { barcode: b.barcode, setNumber: b.setNumber });
-      const rec = { setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' };
+      const rec = { setNumber: (parseSetInput(b.setNumber) || { id: String(j.setNumber) }).id, name: j.name || '', theme: j.theme || '', year: j.year || '' };
       markTried(rec.setNumber);
       if (j.error) { const e = new Error(j.error); e.brickset = true; throw e; }
       lookupCache[b.barcode] = rec; save(LS.cache, lookupCache);
@@ -228,10 +232,11 @@ async function syncNames() {
     calls++; tried = true; markTried(num);
     const barcode = (scans.find(s => s.setNumber === num && s.barcode) || {}).barcode || '';
     try {
-      const j = await api('bind', { barcode, setNumber: num + '-1' });
+      const p = parseSetInput(num);
+      const j = await api('bind', { barcode, setNumber: p ? p.full : num + '-1' }); // exact variant; -1 only when none was typed
       if (j.error) throw new Error(j.error);
-      if (!j.found) { markMiss(num); continue; }
-      fillNames({ setNumber: String(j.setNumber), name: j.name || '', theme: j.theme || '', year: j.year || '' });
+      if (!j.found) { markMiss(num); continue; } // no match for this exact variant: leave the name blank (the row is flagged)
+      fillNames({ setNumber: num, name: j.name || '', theme: j.theme || '', year: j.year || '' });
     } catch (e) { // keep the rows, pause this step for 15 min, try the rest tomorrow; never stops the sync
       setRetry.cool = Date.now() + 15 * 60e3; save(LS.retry, setRetry);
       setStepErr('names', e);
@@ -774,7 +779,10 @@ function render() {
     const t = document.createElement('div'); t.className = 't';
     t.textContent = s.setNumber ? `${s.setNumber}${s.name ? ' ' + s.name : ''} x${s.qty}` : `? x${s.qty}`;
     const sub = document.createElement('div'); sub.className = 's';
-    sub.textContent = `${s.dest} - ${s.barcode || 'manual'} - ${new Date(s.ts).toLocaleTimeString()}` + (s.status === 'needs' ? ' - tap to fix' : '');
+    const noMatch = s.setNumber && !s.name && s.setNumber in setRetry.miss; // Brickset has no set with exactly this number (variant included)
+    sub.textContent = `${s.dest} - ${s.barcode || 'manual'} - ${new Date(s.ts).toLocaleTimeString()}` + (s.status === 'needs' ? ' - tap to fix' : '') +
+      (noMatch ? ` - name left blank: Brickset has no set ${s.setNumber}` : '');
+    if (noMatch) li.classList.add('flag');
     left.append(t, sub);
     const b = document.createElement('span');
     b.className = 'badge ' + s.status;
