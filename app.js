@@ -459,6 +459,7 @@ const stats = { ms: [], frames: [], scans: [], hardTries: 0, hardHits: 0 };
 
 function onCode(raw) {
   const now = Date.now();
+  if (ST.on) { stRead(raw, now); return; } // scan test: log the read only; nothing is added, looked up or synced
   if (raw === lastCode && now - lastAt < 2500) { lastAt = now; return; } // duplicate read
   if (!validBarcode(raw)) return;
   lastCode = raw; lastAt = now;
@@ -488,18 +489,22 @@ function zxingDecode(source, sw, sh, hard) {
   return (hard ? hardReader : fastReader).decode(bmp).getText();
 }
 
-// One attempt on the current frame. Returns the decoded text or ''.
+// One attempt on the current frame. Returns the decoded text or ''. Every pass is logged when Scan test is on.
 async function scanOnce(source = video, sw = video.videoWidth, sh = video.videoHeight) {
   frameNo++;
   const t0 = performance.now();
   let text = '';
   if (detector) {
     try { const r = await detector.detect(source); if (r[0]) text = r[0].rawValue; } catch {}
+    stLog('native', 'native', performance.now() - t0, !!text);
   } else {
     try { text = zxingDecode(source, sw, sh, false); } catch { /* NotFound on empty frames */ }
+    stLog('zxing', 'fast', performance.now() - t0, !!text);
     if (!text && frameNo % HARD_EVERY === 0) {
       stats.hardTries++;
+      const th = performance.now();
       try { text = zxingDecode(source, sw, sh, true); stats.hardHits++; } catch {}
+      stLog('zxing', 'TRY_HARDER', performance.now() - th, !!text);
     }
   }
   const t1 = performance.now();
@@ -507,6 +512,81 @@ async function scanOnce(source = video, sw = video.videoWidth, sh = video.videoH
   stats.frames.push(t1);
   return text;
 }
+
+// ---------- scan test (Debug -> Scan test): logs every decode attempt and each box's time to first read ----------
+// While it is on, reads are only logged: nothing is added to the list, looked up or synced. Kept in memory; off by default.
+const ST = { on: false, attempts: [], boxes: [], cur: null, startedAt: 0, dups: 0, invalid: 0 };
+function stLog(path, pass, ms, ok) {
+  if (!ST.on) return;
+  ST.attempts.push({ t: Date.now(), path, pass, ms, ok });
+  if (ST.attempts.length > 20000) ST.attempts.shift();
+}
+function stNext() { // arm the timer for the next box, then bring the box into the frame
+  if (!ST.on) return;
+  ST.cur = { t0: Date.now(), ttfr: null, code: '', dups: 0 };
+  ST.boxes.push(ST.cur); lastCode = '';
+}
+function stRead(raw, now) {
+  if (!validBarcode(raw)) { ST.invalid++; return; }
+  const b = ST.cur;
+  if (b && b.ttfr === null && b.t0) { b.ttfr = now - b.t0; b.code = raw; b.readAt = now; beep(); return; } // first read of an armed box
+  if (b && b.code === raw) { b.dups++; ST.dups++; return; }                                           // same box read again
+  ST.cur = { t0: 0, ttfr: null, code: raw, dups: 0, readAt: now }; ST.boxes.push(ST.cur); beep();      // read without arming: counted, not timed
+}
+function stReset() { Object.assign(ST, { attempts: [], boxes: [], cur: null, startedAt: Date.now(), dups: 0, invalid: 0 }); }
+const median = a => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const fmt = (n, d = 0) => n === null || n === undefined ? '-' : n.toFixed(d);
+function stSummary() {
+  const A = ST.attempts, read = ST.boxes.filter(b => b.code), timed = ST.boxes.filter(b => b.t0);
+  const within = timed.filter(b => b.ttfr !== null && b.ttfr <= 2000).length;
+  const first = timed.length ? timed[0].t0 : ST.startedAt, last = Math.max(0, ...read.map(b => b.readAt || 0));
+  const mins = last > first ? (last - first) / 60000 : 0;
+  const ttfr = median(timed.filter(b => b.ttfr !== null).map(b => b.ttfr));
+  const lines = [
+    `Attempts: ${A.length} (${A.filter(a => a.ok).length} decoded)`,
+    `Median decode: ${fmt(median(A.map(a => a.ms)), 1)} ms all attempts, ${fmt(median(A.filter(a => a.ok).map(a => a.ms)), 1)} ms successful`,
+    `Boxes read: ${read.length}${timed.length ? ` of ${timed.length} timed` : ''}`,
+    `Reads per minute: ${mins ? fmt(read.length / mins, 1) : '-'}`,
+    `Read within 2 s: ${timed.length ? `${within}/${timed.length} = ${Math.round(100 * within / timed.length)}%` : '-'}`,
+    `Median time to first read: ${ttfr === null ? '-' : fmt(ttfr / 1000, 2) + ' s'}`,
+    `Duplicate reads: ${ST.dups}` + (ST.invalid ? `, bad-checksum reads: ${ST.invalid}` : ''),
+  ];
+  const groups = {};
+  A.forEach(a => { const k = a.path + '/' + a.pass; (groups[k] = groups[k] || []).push(a); });
+  Object.entries(groups).forEach(([k, g]) => lines.push(`  ${k}: ${g.length} tries, ${g.filter(a => a.ok).length} ok, median ${fmt(median(g.map(a => a.ms)), 1)} ms`));
+  return lines.join('\n');
+}
+function stReport() {
+  const lines = [`LEGO Scan test ${new Date().toISOString()}`, `app v${APP_VERSION}, ${scriptLabel()}, detector ${detector ? 'native' : 'zxing'}`,
+    navigator.userAgent, stSummary(), 'Per box (time from "Next box" to first read):'];
+  ST.boxes.forEach((b, i) => lines.push(`  ${i + 1}. ${b.t0 ? (b.ttfr === null ? 'NOT READ' : (b.ttfr / 1000).toFixed(2) + ' s') : 'read, not timed'}${b.code ? ' ' + b.code : ''}${b.dups ? ' dup reads ' + b.dups : ''}`));
+  return lines.join('\n');
+}
+function renderTst() {
+  $('tst').hidden = !debugOn;
+  $('tstToggle').textContent = ST.on ? 'Scan test: ON' : 'Scan test: off';
+  $('tstToggle').classList.toggle('on', ST.on);
+  const has = ST.on || ST.attempts.length || ST.boxes.length;
+  $('tstNext').hidden = !ST.on;
+  $('tstCopy').hidden = $('tstReset').hidden = !has;
+  $('tstOut').hidden = !has;
+  if (has) $('tstOut').textContent = (ST.on ? 'Reads are logged only; nothing is added to your list.\n' : '') + stSummary();
+}
+$('tstToggle').onclick = () => { ST.on = !ST.on; if (ST.on) stReset(); renderTst(); };
+$('tstNext').onclick = () => { stNext(); renderTst(); };
+$('tstReset').onclick = () => { stReset(); renderTst(); };
+$('tstCopy').onclick = async () => {
+  const text = stReport(), b = $('tstCopy');
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+  if (!ok) { // no clipboard permission: select-and-copy fallback
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;top:0;opacity:0';
+    document.body.append(ta); ta.select(); try { ok = document.execCommand('copy'); } catch {} ta.remove();
+  }
+  b.textContent = ok ? 'Copied' : 'Copy failed - select the text above';
+  if (!ok) { $('tstOut').textContent = text; $('tstOut').hidden = false; }
+  setTimeout(() => { b.textContent = 'Copy results'; }, 2500);
+};
 
 async function scanLoop() {
   if (!loopOn) return;
@@ -532,8 +612,8 @@ function renderDebug() {
     `${stats.scans.length} scans/min` + (detector ? '' : ` | hard ${stats.hardHits}/${stats.hardTries}`) +
     ` | app v${APP_VERSION} | ${scriptLabel()}`;
 }
-$('dbgBtn').onclick = () => { debugOn = !debugOn; save('legoscan.debug', debugOn); renderDebug(); };
-setInterval(renderDebug, 500);
+$('dbgBtn').onclick = () => { debugOn = !debugOn; if (!debugOn) ST.on = false; save('legoscan.debug', debugOn); renderDebug(); renderTst(); };
+setInterval(() => { renderDebug(); if (ST.on) renderTst(); }, 500);
 
 async function startCamera() {
   $('startBtn').hidden = true;
@@ -747,5 +827,5 @@ $('cfgBtn').onclick = () => {
   save(LS.cfg, cfg); render(); renderBanner(); sync(); pullCache();
 };
 
-setDest(dest); render(); setMode(mode); checkScript(true).then(pullCache).then(sync); // handshake on launch
+setDest(dest); render(); renderTst(); setMode(mode); checkScript(true).then(pullCache).then(sync); // handshake on launch
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

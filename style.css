@@ -27,6 +27,13 @@ video{width:100%;height:100%;object-fit:cover}
 .reticle i:nth-child(3){left:-3px;bottom:-3px;border-right:0;border-top:0;border-bottom-left-radius:10px}
 .reticle i:nth-child(4){right:-3px;bottom:-3px;border-left:0;border-top:0;border-bottom-right-radius:10px}
 .dbg{font:12px ui-monospace,Menlo,monospace;color:#8f8;background:#000;border-radius:8px;padding:6px 10px;margin:8px 0 0;text-align:center}
+.tst{margin:8px 0 0}
+.tst[hidden]{display:none}
+.trow{display:flex;gap:8px;margin:6px 0}
+.trow button{flex:1}
+.trow button[hidden]{display:none}
+.tst .on{background:var(--ok)}
+#tstOut{font:12px/1.4 ui-monospace,Menlo,monospace;background:#000;color:#8f8;border-radius:8px;padding:8px 10px;margin:0;white-space:pre-wrap}
 .flash{position:absolute;inset:0;background:var(--ok);opacity:0;pointer-events:none;transition:opacity .4s}
 .flash.on{opacity:.55;transition:none}
 .start{position:absolute;inset:0;width:100%;height:100%;border-radius:0;background:rgba(0,0,0,.6);font-size:20px}

@@ -107,6 +107,44 @@ async function main() {
     t.done();
   }
 
+  head('2. Scan test logging');
+  {
+    const ean = d12 => d12 + ((10 - d12.split('').reduce((a, n, i) => a + n * (i % 2 ? 3 : 1), 0) % 10) % 10);
+    const code = ean('673419340595');
+    const t = await app({ ls: { 'legoscan.debug': true } });
+    await sleep(700);
+    check('off by default', t.ev('ST.on') === false);
+    check('controls show when Debug is on', !t.el('tst').hidden);
+    t.el('tstToggle').click();
+    check('toggle turns it on', t.ev('ST.on') === true);
+    t.w.eval(`detector = { detect: async () => [{ rawValue: '${code}' }] }`);
+    t.el('tstNext').click();
+    let text = await t.w.eval('scanOnce({}, 1, 1)'); t.w.eval(`onCode('${text}')`);       // first read of the box
+    await sleep(30);
+    text = await t.w.eval('scanOnce({}, 1, 1)'); t.w.eval(`onCode('${text}')`);           // same box again -> duplicate
+    t.w.eval(`detector = { detect: async () => [] }`);
+    await t.w.eval('scanOnce({}, 1, 1)');                                                   // an attempt that fails
+    const a = JSON.parse(t.ev('JSON.stringify(ST.attempts)')), b = JSON.parse(t.ev('JSON.stringify(ST.boxes)'));
+    eq('3 attempts logged (2 ok, 1 fail)', [a.length, a.filter(x => x.ok).length], [3, 2]);
+    check('attempt records path, pass and decode ms', a[0].path === 'native' && a[0].pass === 'native' && typeof a[0].ms === 'number', a[0]);
+    check('time to first read recorded for the box', b.length === 1 && typeof b[0].ttfr === 'number' && b[0].ttfr >= 0, b);
+    eq('duplicate read counted', t.ev('ST.dups'), 1);
+    eq('scan test adds nothing to the scan list', t.ev('scans.length'), 0);
+    eq('and makes no lookup calls', t.calls.filter(c => c.action === 'lookup' || c.action === 'bind').length, 0);
+    const sum = t.ev('stSummary()');
+    check('summary has median, reads/min, within-2s %', /Median decode/.test(sum) && /Reads per minute/.test(sum) && /Read within 2 s: 1\/1 = 100%/.test(sum), sum);
+    const rep = t.ev('stReport()');
+    check('report is copy-ready (versions, summary, per box)', /app v\d+/.test(rep) && /Per box/.test(rep) && rep.includes(code), rep);
+    // ZXing path: fast pass misses, TRY_HARDER pass hits (every 4th frame)
+    t.w.eval(`detector = null; frameNo = 3; zxingDecode = (s, w, h, hard) => { if (!hard) throw new Error('nf'); return '${code}'; }`);
+    await t.w.eval('scanOnce({}, 1, 1)');
+    const z = JSON.parse(t.ev('JSON.stringify(ST.attempts.slice(-2))'));
+    eq('zxing fast then TRY_HARDER logged', z.map(x => [x.path, x.pass, x.ok]), [['zxing', 'fast', false], ['zxing', 'TRY_HARDER', true]]);
+    t.el('dbgBtn').click();
+    eq('turning Debug off stops the test', t.ev('ST.on'), false);
+    t.done();
+  }
+
   // @@MORE@@
 
   localStorage.clear();
