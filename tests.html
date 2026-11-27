@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>LEGO Scan tests</title>
+<style>body{font:14px/1.5 ui-monospace,Menlo,monospace;background:#111;color:#eee;padding:16px}.p{color:#6c6}.f{color:#f66;font-weight:bold}h3{margin:18px 0 4px;color:#aaa}</style>
+<h2>LEGO Scan tests</h2>
+<p>Open via <code>py serve.py</code> at http://localhost:8080/tests.html. Runs the real app in a hidden iframe against a fake script backend,
+and runs Code.gs functions with stubbed Google services. It saves and restores this origin's localStorage, so your local app data is kept.</p>
+<div id="out"></div>
+<script>
+'use strict';
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(fn, ms = 4000) { const t = Date.now(); while (Date.now() - t < ms) { if (await fn()) return true; await sleep(40); } return false; }
+function head(t) { const h = document.createElement('h3'); h.textContent = t; out.append(h); }
+function check(name, ok, detail) {
+  const d = document.createElement('div'); d.className = ok ? 'p' : 'f';
+  d.textContent = (ok ? 'PASS ' : 'FAIL ') + name + (!ok && detail !== undefined ? '  -> ' + JSON.stringify(detail) : '');
+  out.append(d); ok ? pass++ : fail++;
+}
+const eq = (name, got, want) => check(name, JSON.stringify(got) === JSON.stringify(want), { got, want });
+
+// ---- run the real app (index.html + app.js) in an iframe with a fake Apps Script backend ----
+let indexHtml = '';
+async function app({ ls = {}, handler } = {}) {
+  const calls = [];
+  window.__fake = body => {
+    calls.push(body);
+    let res = handler ? handler(body, calls) : undefined;
+    if (res === undefined) {
+      res = body.action === 'version' ? { ok: true, version: 99 } : body.action === 'cache' ? { ok: true, rows: [] }
+        : body.action === 'upsert' ? { ok: true, count: (body.scans || []).length } : { ok: true };
+    }
+    return Promise.resolve({ json: async () => res });
+  };
+  localStorage.clear();
+  const base = { 'legoscan.cfg': { url: 'http://fake.invalid/exec', secret: 'x' } };
+  Object.entries({ ...base, ...ls }).forEach(([k, v]) => localStorage.setItem(k, JSON.stringify(v)));
+  const f = document.createElement('iframe');
+  f.style.cssText = 'width:420px;height:300px;border:0;position:absolute;left:-9999px';
+  f.srcdoc = indexHtml.replace('<head>', '<head><base href="' + location.origin + '/">')
+    .replace('<script src="vendor/zxing.min.js"><\/script>', '')
+    .replace('<script src="app.js">', '<script>window.fetch=(u,o)=>parent.__fake(JSON.parse(o.body));<\/script><script src="app.js">');
+  document.body.append(f);
+  await until(() => f.contentWindow.document.readyState === 'complete' && f.contentWindow.eval('typeof sync') === 'function');
+  const w = f.contentWindow;
+  return { w, calls, ev: s => w.eval(s), el: id => w.document.getElementById(id), done: () => f.remove(),
+    type: v => { w.document.getElementById('manualInput').value = v; w.document.getElementById('manual').requestSubmit(); } };
+}
+
+// ---- run Code.gs functions with stubbed Google services ----
+let codeGs = '';
+function gas(stubs = {}) {
+  const names = Object.keys(stubs);
+  const body = codeGs + '\n;return {' + ['SCRIPT_VERSION', 'bindSet', 'recFromSet', 'doPost', 'analyzeInventory', 'out']
+    .map(n => `${n}: typeof ${n} === 'undefined' ? undefined : ${n}`).join(',') + '};';
+  return new Function(...names, 'SpreadsheetApp', 'ContentService', 'PropertiesService', 'LockService', 'Utilities', 'UrlFetchApp', body)(
+    ...names.map(n => stubs[n]), {}, { MimeType: { JSON: 1 }, createTextOutput: s => ({ s, setMimeType() { return this; } }) },
+    { getScriptProperties: () => ({ getProperty: k => ({ SECRET: 's', BRICKSET_KEY: 'k' })[k] || null, setProperties() {} }) },
+    { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) }, { formatDate: () => '2026-01-01' }, {});
+}
+
+// ================= tests are appended below =================
+async function main() {
+  indexHtml = await (await fetch('index.html')).text();
+  codeGs = await (await fetch('apps-script/Code.gs')).text();
+  const snapshot = Object.entries(localStorage);
+
+  head('1. Version handshake');
+  {
+    const g = gas();
+    check('Code.gs exports SCRIPT_VERSION as a number', typeof g.SCRIPT_VERSION === 'number', g.SCRIPT_VERSION);
+    const r = JSON.parse(g.doPost({ postData: { contents: JSON.stringify({ token: 's', action: 'version' }) } }).s);
+    check("'version' action returns SCRIPT_VERSION", r.ok && r.version === g.SCRIPT_VERSION, r);
+    const expected = Number((await (await fetch('app.js')).text()).match(/EXPECTED_SCRIPT = (\d+)/)[1]);
+    eq('app expects the same version Code.gs has', expected, g.SCRIPT_VERSION);
+  }
+  {
+    const t = await app({ handler: b => b.action === 'version' ? { ok: false, error: 'unknown action' } : undefined });
+    await until(() => !t.el('banner').hidden);
+    check('missing version action -> banner shown', !t.el('banner').hidden);
+    check('banner text', t.el('banner').textContent.startsWith('Sheet script is out of date. In the script editor: Deploy > Manage deployments > New version.'), t.el('banner').textContent);
+    t.done();
+  }
+  {
+    const t = await app({ handler: b => b.action === 'version' ? { ok: true, version: 0 } : undefined });
+    await until(() => !t.el('banner').hidden);
+    check('older version -> banner shown', !t.el('banner').hidden);
+    t.done();
+  }
+  {
+    const t = await app({ ls: { 'legoscan.debug': true } });
+    await sleep(900);
+    check('current version -> no banner', t.el('banner').hidden);
+    const dbg = t.el('dbg').textContent;
+    check('Debug shows app and script version', /app v\d+/.test(dbg) && /script v99/.test(dbg), dbg);
+    t.type('75192');
+    await until(() => t.calls.some(c => c.action === 'upsert'));
+    const names = t.calls.map(c => c.action);
+    check('version is called on launch, before the first upsert', names.indexOf('version') >= 0 && names.indexOf('version') < names.indexOf('upsert'), names);
+    t.done();
+  }
+  {
+    const t = await app({ handler: b => b.action === 'version' ? { ok: false, error: 'unauthorized' } : undefined });
+    await sleep(600);
+    check('bad secret / other errors do not claim the script is old', t.el('banner').hidden);
+    t.done();
+  }
+
+  // @@MORE@@
+
+  localStorage.clear();
+  snapshot.forEach(([k, v]) => localStorage.setItem(k, v));
+  const s = document.createElement('h2'); s.textContent = `${pass} passed, ${fail} failed`; s.className = fail ? 'f' : 'p'; out.prepend(s);
+  document.title = (fail ? 'FAIL ' : 'PASS ') + pass + '/' + (pass + fail);
+}
+main().catch(e => { check('test run crashed', false, String(e && e.stack || e)); document.title = 'FAIL crashed'; });
+</script>

@@ -16,7 +16,10 @@
  * lookup() reads the Lookup Cache tab first and only calls Brickset on a miss.
  *   upsert  { scans: [...] }     -> { ok, count }   (insert, or update by Scan ID)
  *   remove  { ids: [...] }       -> { ok, count }
+ *   version {}                   -> { ok, version }  (SCRIPT_VERSION; the app compares it with the version it expects)
  */
+// Bump this whenever the app/script API or behaviour changes, and bump EXPECTED_SCRIPT in app.js to match.
+const SCRIPT_VERSION = 1;
 const STAGING = 'Scan Staging';
 const CACHE = 'Lookup Cache';
 const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID',
@@ -46,6 +49,7 @@ function doPost(e) {
     else if (req.action === 'recountReset') res = recountReset();
     else if (req.action === 'upsert') res = upsert(req.scans || []);
     else if (req.action === 'remove') res = remove(req.ids || []);
+    else if (req.action === 'version') res = { ok: true, version: SCRIPT_VERSION };
     else res = { ok: false, error: 'unknown action' };
     res.bsUsed = bsCountToday(); // Brickset API calls this script has made today (UTC), so the app can show N/100
     return out(res);
@@ -56,7 +60,7 @@ function doPost(e) {
   }
 }
 
-function doGet() { return out({ ok: true, service: 'lego-scan' }); }
+function doGet() { return out({ ok: true, service: 'lego-scan', version: SCRIPT_VERSION }); }
 
 function out(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);

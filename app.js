@@ -80,6 +80,42 @@ async function api(action, payload) {
   return j;
 }
 
+// ---------- version handshake ----------
+// APP_VERSION matches the service worker cache number (lego-scan-vN). EXPECTED_SCRIPT is the lowest SCRIPT_VERSION in
+// Code.gs this app can work with; bump it together with SCRIPT_VERSION whenever the script's API or behaviour changes.
+const APP_VERSION = 15;
+const EXPECTED_SCRIPT = 1;
+const SCRIPT_OLD_MSG = 'Sheet script is out of date. In the script editor: Deploy > Manage deployments > New version.';
+let scriptInfo = { state: 'unchecked', version: null, at: 0, tried: 0 }; // state: unchecked | ok | old | missing | unknown
+async function checkScript(force) {
+  if (!configured() || !navigator.onLine) return;
+  const now = Date.now();
+  if (!force && ((scriptInfo.state === 'ok' && now - scriptInfo.at < 120e3) || now - scriptInfo.tried < 10e3)) return;
+  scriptInfo.tried = now;
+  try {
+    const j = await api('version');
+    const v = Number(j.version);
+    scriptInfo = { state: v >= EXPECTED_SCRIPT ? 'ok' : 'old', version: Number.isFinite(v) ? v : null, at: Date.now(), tried: now };
+  } catch (e) {
+    if (/unknown action/i.test(e.message)) scriptInfo = { state: 'missing', version: null, at: Date.now(), tried: now };
+    else if (scriptInfo.state === 'unchecked') scriptInfo.state = 'unknown'; // offline / bad secret: say nothing about the version
+  }
+  renderBanner();
+}
+function renderBanner() {
+  const b = $('banner');
+  const bad = configured() && (scriptInfo.state === 'old' || scriptInfo.state === 'missing');
+  b.hidden = !bad;
+  if (!bad) return;
+  b.textContent = SCRIPT_OLD_MSG;
+  const d = document.createElement('div'); d.className = 'sub';
+  d.textContent = scriptInfo.state === 'missing' ? `The script has no version check (app needs script v${EXPECTED_SCRIPT}+).`
+    : `The script is v${scriptInfo.version ?? '?'}, the app needs v${EXPECTED_SCRIPT}+.`;
+  b.append(d);
+}
+const scriptLabel = () => !configured() ? 'script -' : scriptInfo.state === 'ok' || scriptInfo.state === 'old' ? `script v${scriptInfo.version ?? '?'}` +
+  (scriptInfo.state === 'old' ? ' OLD' : '') : scriptInfo.state === 'missing' ? 'script OLD (no version)' : 'script ?';
+
 // Pull every barcode -> set the sheet knows into the local cache, so known barcodes match offline
 // and never spend a Brickset call. Barcodes with a set number still waiting to sync are left alone.
 async function pullCache() {
@@ -211,6 +247,7 @@ async function sync() {
   if (!configured() || !navigator.onLine || syncing) return;
   syncing = true;
   let didWork = false;
+  await checkScript(); // handshake before every sync (throttled); an old script only shows the banner, sync still runs
   // Every step is isolated: a failure is recorded (and stays on screen) but never stops the steps after it,
   // so lookup/bind trouble can never block the upload of scans.
   const step = async (name, fn, own) => {
@@ -492,7 +529,8 @@ function renderDebug() {
   stats.scans = stats.scans.filter(t => wall - t < 60000);
   const avg = stats.ms.length ? stats.ms.reduce((a, b) => a + b, 0) / stats.ms.length : 0;
   $('dbg').textContent = `${detector ? 'native' : 'zxing'} | ${avg.toFixed(0)} ms/decode | ${(stats.frames.length / 5).toFixed(1)} fps | ` +
-    `${stats.scans.length} scans/min` + (detector ? '' : ` | hard ${stats.hardHits}/${stats.hardTries}`);
+    `${stats.scans.length} scans/min` + (detector ? '' : ` | hard ${stats.hardHits}/${stats.hardTries}`) +
+    ` | app v${APP_VERSION} | ${scriptLabel()}`;
 }
 $('dbgBtn').onclick = () => { debugOn = !debugOn; save('legoscan.debug', debugOn); renderDebug(); };
 setInterval(renderDebug, 500);
@@ -705,8 +743,9 @@ $('cfgBtn').onclick = () => {
   resumeCam();
   if (secret === null) return;
   cfg = { url: url.trim(), secret: (secret || '').trim() };
-  save(LS.cfg, cfg); render(); sync(); pullCache();
+  scriptInfo = { state: 'unchecked', version: null, at: 0, tried: 0 };
+  save(LS.cfg, cfg); render(); renderBanner(); sync(); pullCache();
 };
 
-setDest(dest); render(); setMode(mode); pullCache().then(sync);
+setDest(dest); render(); setMode(mode); checkScript(true).then(pullCache).then(sync); // handshake on launch
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
