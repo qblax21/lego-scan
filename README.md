@@ -42,6 +42,17 @@ The footer shows "Brickset lookups used today: N/100" (the script's own count, U
 New scans go to the "Scan Staging" tab (never your main tabs); lookups are cached in "Lookup Cache".
 Brickset allows about 100 lookups per day per key; cached barcodes cost nothing.
 
+The app checks the script's version on launch and before each sync. If the deployed script is older than the app expects,
+a banner says so ("Sheet script is out of date ... New version."). The Debug readout shows the app and script versions.
+
+### Scan test and data check
+**Debug -> Scan test** logs decode attempts and time to first read per box (tap **Next box** before each box); **Copy results**
+copies a summary. Reads are only logged while it is on. The 5-minute routine is in `TEST_PLAN.md`.
+**LEGO Scan -> Check inventory data** (sheet menu) reads Personal and Sale Inventory without changing them and writes a **Data Check**
+tab with a count per issue and the row numbers: missing set number or name, wrong set-number format, same set in both tabs,
+duplicate rows, names that differ from Lookup Cache, blank values, and values older than 30 days (from Value Updated).
+Variant sets are kept: `75192-2` is stored and looked up as that exact variant; `-1` is only the default when none is typed.
+
 ### Recount mode
 Switch the app to **Recount**: each scan adds one to that set's tally (with + / - buttons) and syncs to a **Recount** tab
 instead of Scan Staging. **New recount** clears the tally and the Recount tab. In the sheet, **LEGO Scan -> Compare recount

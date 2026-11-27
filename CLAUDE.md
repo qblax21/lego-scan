@@ -30,7 +30,7 @@ The working folder is not a git repo; a helper script clones the repo, copies wh
 powershell -File "<scratchpad>\push.ps1" -Message "commit message"
 ```
 The scratchpad copy of `push.ps1` is session-specific; if missing, recreate it (clone `qblax21/lego-scan`, copy files, `git add -A`, commit, push).
-Whitelist in the script: `app.js index.html style.css sw.js manifest.webmanifest README.md TEST_PLAN.md STATUS.md CLAUDE.md LICENSE serve.py apps-script\Code.gs icons\ vendor\`.
+Whitelist in the script: `app.js index.html style.css sw.js manifest.webmanifest README.md TEST_PLAN.md STATUS.md CLAUDE.md LICENSE serve.py tests.html apps-script\Code.gs icons\ vendor\`.
 Git author: `Quinn Brownell`, email `<github user id>+qblax21@users.noreply.github.com`.
 Commit messages end with the Co-Authored-By line given by the session.
 Do not push secrets. The Brickset key and the SECRET never go in files.
@@ -57,4 +57,6 @@ Symptom of a stale deployment: the app footer shows "Sync problem: ... unknown a
 - Do not edit the user's inventory column layout; the script only writes columns that already exist.
 
 ## Testing
-No automated tests. Verified so far with a desktop browser using fake backends (old script, Brickset error, nameless retry, quota cutoff). See `TEST_PLAN.md` (older) and the test steps in `STATUS.md` next steps.
+With `py serve.py` running, open http://localhost:8080/tests.html: browser tests that run the real app against a fake backend and run `Code.gs` with stubbed Google services. The tab title says PASS or FAIL. Run it after any change to `app.js` or `Code.gs`.
+When the script's API or behaviour changes, bump `SCRIPT_VERSION` in `Code.gs` and `EXPECTED_SCRIPT` in `app.js` together (the tests check they match).
+No other automated tests. Earlier verification used with a desktop browser using fake backends (old script, Brickset error, nameless retry, quota cutoff). See `TEST_PLAN.md` (older) and the test steps in `STATUS.md` next steps.
