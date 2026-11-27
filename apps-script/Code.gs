@@ -19,7 +19,7 @@
  *   version {}                   -> { ok, version }  (SCRIPT_VERSION; the app compares it with the version it expects)
  */
 // Bump this whenever the app/script API or behaviour changes, and bump EXPECTED_SCRIPT in app.js to match.
-const SCRIPT_VERSION = 2; // 2: exact set-number variants (75192-2 is looked up and returned as 75192-2, never as -1)
+const SCRIPT_VERSION = 3; // 2: exact set-number variants (75192-2 is looked up and returned as 75192-2, never as -1); 3: Check inventory data menu
 const STAGING = 'Scan Staging';
 const CACHE = 'Lookup Cache';
 const COLS = ['Timestamp', 'Destination', 'Set #', 'Set Name', 'Theme', 'Year', 'Qty', 'Condition', 'Barcode', 'Status', 'Scan ID',
@@ -326,6 +326,175 @@ function compareRecount() {
     'Difference = Counted - (Personal + Sale). Your inventory tabs were not changed.');
 }
 
+// ---------- menu: Check inventory data (read-only on the inventory tabs; writes the "Data Check" tab) ----------
+const DATA_CHECK = 'Data Check';
+const STALE_DAYS = 30;
+const CHECK_TABS = [
+  { tab: 'Personal Inventory', nameHdr: 'Item', valueHdr: 'Value of One' },
+  { tab: 'Sale Inventory', nameHdr: 'Set Name', valueHdr: 'Est. Sale Price' },
+];
+const ISSUES = [
+  ['missing', 'Missing set number or name'],
+  ['format', 'Set number in the wrong format (expected 12345 or 12345-2)'],
+  ['both', 'Same set in both Personal and Sale Inventory'],
+  ['dupe', 'Duplicate rows (same set, condition, cost, date and location)'],
+  ['cache', 'Name does not match Lookup Cache'],
+  ['blank', 'Value is blank'],
+  ['stale', 'Value older than ' + STALE_DAYS + ' days (from Value Updated)'],
+  ['nodate', 'Value has no readable Value Updated date'],
+];
+
+// "75192" and "75192-1" are the same set; "75192-2" is a different variant. null = not a valid set number.
+function setKey(v) {
+  const m = /^(\d{3,6})(?:-(\d{1,2}))?$/.exec(String(v).trim());
+  if (!m) return null;
+  const variant = m[2] === undefined ? 1 : Number(m[2]);
+  if (!variant) return null;
+  return variant > 1 ? m[1] + '-' + variant : m[1];
+}
+
+// Pure function (no Sheets calls) so it can be tested. tabs: [{ tab, nameHdr, valueHdr, found, head, display, raw }] where
+// display/raw are the data rows below the header (getDisplayValues / getValues); data row i is sheet row i + 2.
+// cacheRows: [[barcode, setNumber, name], ...] or null when the Lookup Cache tab does not exist.
+function analyzeInventory(tabs, cacheRows, now) {
+  const issues = [], notes = [], checked = {};
+  const add = (type, t, row, set, name, detail) => issues.push({ type: type, tab: t.tab, row: row, set: set, name: name, detail: detail });
+  const norm = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+  const isDate = v => !!v && typeof v.getTime === 'function';
+
+  const cacheNames = {}; // set key -> { normalised name: original name }
+  if (cacheRows) {
+    cacheRows.forEach(r => {
+      const k = setKey(r[1]), n = String(r[2] || '').trim();
+      if (k && n) { cacheNames[k] = cacheNames[k] || {}; cacheNames[k][norm(n)] = n; }
+    });
+  } else notes.push('Lookup Cache tab not found: name check skipped.');
+
+  const bySet = {}; // set key -> { tab name: [rows] }, for the "same set in both tabs" check
+  tabs.forEach(t => {
+    if (!t.found) { notes.push('Tab "' + t.tab + '" not found: skipped.'); return; }
+    const ix = h => t.head.indexOf(h);
+    const iSet = ix('Set #'), iName = ix(t.nameHdr), iQty = ix('Qty'), iCond = ix('Condition'), iVal = ix(t.valueHdr), iUpd = ix(UPD_COL);
+    if (iSet < 0) { notes.push('Tab "' + t.tab + '" has no "Set #" column: skipped.'); return; }
+    if (iName < 0) notes.push('Tab "' + t.tab + '" has no "' + t.nameHdr + '" column: name checks skipped.');
+    if (iVal < 0) notes.push('Tab "' + t.tab + '" has no "' + t.valueHdr + '" column: value checks skipped.');
+    else if (iUpd < 0) notes.push('Tab "' + t.tab + '" has no "' + UPD_COL + '" column (run LEGO Scan > Update values): age check skipped.');
+    const cell = (r, i) => i < 0 ? '' : String(t.display[r][i]).trim();
+    const dupeCols = ['Condition', 'Bought For', 'Purchase Date', 'Location'].map(ix).filter(i => i >= 0);
+    const groups = {};
+    let n = 0;
+    t.display.forEach((rowVals, r) => {
+      const set = cell(r, iSet), name = cell(r, iName), row = r + 2;
+      if (!(set || name || cell(r, iQty) || cell(r, iCond))) return; // empty / pre-formatted row (formula columns don't count)
+      n++;
+      const key = setKey(set);
+      if (!set || (iName >= 0 && !name)) {
+        add('missing', t, row, set, name, !set && iName >= 0 && !name ? 'no set number and no name' : !set ? 'no set number' : 'no name');
+      }
+      if (set && (key === null || String(t.display[r][iSet]) !== set)) add('format', t, row, set, name, 'Set # "' + t.display[r][iSet] + '"');
+      if (key) {
+        bySet[key] = bySet[key] || {};
+        (bySet[key][t.tab] = bySet[key][t.tab] || []).push(row);
+        const gk = key + '|' + dupeCols.map(i => norm(t.display[r][i])).join('|');
+        (groups[gk] = groups[gk] || []).push(row);
+        const names = cacheNames[key];
+        if (name && names && !names[norm(name)]) {
+          add('cache', t, row, set, name, 'sheet "' + name + '" vs cache "' + Object.keys(names).map(k => names[k]).slice(0, 2).join('" / "') + '"');
+        }
+      }
+      if (iVal >= 0) {
+        if (!cell(r, iVal)) add('blank', t, row, set, name, 'no ' + t.valueHdr);
+        else if (iUpd >= 0) {
+          const raw = t.raw[r][iUpd];
+          let d = null;
+          if (isDate(raw)) d = raw;
+          else if (String(raw).trim()) { const p = new Date(String(raw).trim()); if (!isNaN(p.getTime())) d = p; }
+          if (!d) add('nodate', t, row, set, name, String(raw).trim() ? 'unreadable date "' + raw + '"' : 'value present but ' + UPD_COL + ' is empty');
+          else {
+            const age = Math.floor((now.getTime() - d.getTime()) / 86400000);
+            if (age > STALE_DAYS) add('stale', t, row, set, name, 'updated ' + d.toISOString().slice(0, 10) + ' (' + age + ' days ago)');
+          }
+        }
+      }
+    });
+    Object.keys(groups).filter(k => groups[k].length > 1).forEach(k => groups[k].forEach(row => {
+      const r = row - 2, others = groups[k].filter(x => x !== row);
+      add('dupe', t, row, cell(r, iSet), cell(r, iName), 'same as row ' + others.join(', '));
+    }));
+    checked[t.tab] = n;
+  });
+
+  // the same set (same variant) in both tabs: every row of it, on both sides
+  Object.keys(bySet).forEach(k => {
+    const tabsHere = Object.keys(bySet[k]);
+    if (tabsHere.length < 2) return;
+    tabs.forEach(t => (bySet[k][t.tab] || []).forEach(row => {
+      const other = tabsHere.filter(x => x !== t.tab).map(x => x + ' row ' + bySet[k][x].join(', ')).join('; ');
+      const r = row - 2, iSet = t.head.indexOf('Set #'), iName = t.head.indexOf(t.nameHdr);
+      add('both', t, row, String(t.display[r][iSet]).trim(), iName < 0 ? '' : String(t.display[r][iName]).trim(), 'also in ' + other);
+    }));
+  });
+
+  const order = {}; ISSUES.forEach((x, i) => { order[x[0]] = i; });
+  const tabOrder = {}; tabs.forEach((t, i) => { tabOrder[t.tab] = i; });
+  issues.sort((a, b) => order[a.type] - order[b.type] || tabOrder[a.tab] - tabOrder[b.tab] || a.row - b.row);
+  const counts = {}; ISSUES.forEach(x => { counts[x[0]] = 0; });
+  issues.forEach(i => { counts[i.type]++; });
+  return { issues: issues, counts: counts, notes: notes, checked: checked };
+}
+
+// Menu: LEGO Scan -> Check inventory data. Reads the two inventory tabs (never writes to them) and rewrites the "Data Check" tab.
+function checkInventoryData() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tabs = CHECK_TABS.map(t => {
+    const sh = ss.getSheetByName(t.tab);
+    const res = Object.assign({}, t, { found: !!sh, head: [], display: [], raw: [] });
+    if (!sh || sh.getLastColumn() < 1) return res;
+    res.head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    if (sh.getLastRow() > 1) {
+      const rng = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn());
+      res.display = rng.getDisplayValues();
+      res.raw = rng.getValues();
+    }
+    return res;
+  });
+  const cs = ss.getSheetByName(CACHE); // only read: the sheet() helper would create the tab
+  const cacheRows = cs ? (cs.getLastRow() > 1 ? cs.getRange(2, 1, cs.getLastRow() - 1, 3).getDisplayValues() : []) : null;
+  const now = new Date();
+  const a = analyzeInventory(tabs, cacheRows, now);
+
+  const W = 6, rows = [], bold = [], shade = [];
+  const push = r => { while (r.length < W) r.push(''); rows.push(r); return rows.length; };
+  push(['Data Check', 'Checked ' + Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm') + '. Inventory tabs were only read, never changed.']);
+  push([Object.keys(a.checked).map(k => k + ': ' + a.checked[k] + ' rows').join('   ') || 'No inventory rows found.']);
+  a.notes.forEach(n => push(['Note: ' + n]));
+  push([]);
+  bold.push(push(['Issue', 'Count']));
+  ISSUES.forEach(x => { const r = push([x[1], a.counts[x[0]]]); if (a.counts[x[0]] > 0) shade.push(r); });
+  push([]);
+  bold.push(push(['Issue', 'Tab', 'Row', 'Set #', 'Name', 'Detail']));
+  const label = {}; ISSUES.forEach(x => { label[x[0]] = x[1]; });
+  a.issues.forEach(i => push([label[i.type], i.tab, i.row, i.set, i.name, i.detail]));
+  if (!a.issues.length) push(['No issues found.']);
+
+  let out = ss.getSheetByName(DATA_CHECK);
+  if (!out) out = ss.insertSheet(DATA_CHECK);
+  out.clear();
+  out.getRange(1, 4, rows.length, 1).setNumberFormat('@'); // keep set numbers as text
+  out.getRange(1, 1, rows.length, W).setValues(rows);
+  bold.forEach(r => out.getRange(r, 1, 1, W).setFontWeight('bold'));
+  out.getRange(1, 1).setFontWeight('bold').setFontSize(14);
+  shade.forEach(r => out.getRange(r, 1, 1, 2).setBackground('#fce8e6'));
+  out.setColumnWidth(1, 330); out.setColumnWidth(5, 220); out.setColumnWidth(6, 330);
+  ss.setActiveSheet(out);
+
+  ui.alert('Inventory data check', (a.issues.length ? a.issues.length + ' flagged row(s):\n\n' : 'No issues found.\n\n') +
+    ISSUES.map(x => a.counts[x[0]] + '  ' + x[1]).join('\n') +
+    (a.notes.length ? '\n\n' + a.notes.join('\n') : '') +
+    '\n\nRow numbers are on the "' + DATA_CHECK + '" tab. Your inventory tabs were not changed.', ui.ButtonSet.OK);
+}
+
 // ---------- menu: move staging rows into the real inventory tabs ----------
 // Only columns that exist in the target tab are written. Cells the scanner has no value for stay blank,
 // except the Sale tab's per-row formulas (copied from the row above) and its Fee % / Target Profit defaults.
@@ -353,6 +522,7 @@ function onOpen() {
     .addItem('Move selected staging rows to inventory', 'moveSelected')
     .addItem('Update values for selected rows (Brickset)', 'updateValues')
     .addItem('Compare recount to inventory', 'compareRecount')
+    .addItem('Check inventory data', 'checkInventoryData')
     .addToUi();
 }
 

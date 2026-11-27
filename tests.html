@@ -51,7 +51,7 @@ async function app({ ls = {}, handler } = {}) {
 // ---- run Code.gs functions with stubbed Google services ----
 let codeGs = '';
 // brickset(params) -> array of Brickset sets; every getSets call goes through it (queries are recorded in gas.queries).
-function gas(brickset = () => []) {
+function gas(brickset = () => [], sheetsApp = {}) {
   gas.queries = [];
   const fetchStub = { fetch: (url, o) => {
     const params = JSON.parse(decodeURIComponent(/params=([^&]*)/.exec(o.payload)[1]));
@@ -59,10 +59,10 @@ function gas(brickset = () => []) {
     return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ status: 'success', sets: brickset(params) }) };
   } };
   const names = [];
-  const body = codeGs + '\n;return {' + ['SCRIPT_VERSION', 'bindSet', 'recFromSet', 'doPost', 'analyzeInventory', 'out']
+  const body = codeGs + '\n;return {' + ['SCRIPT_VERSION', 'bindSet', 'recFromSet', 'doPost', 'analyzeInventory', 'checkInventoryData', 'out']
     .map(n => `${n}: typeof ${n} === 'undefined' ? undefined : ${n}`).join(',') + '};';
-  return new Function(...names, 'SpreadsheetApp', 'ContentService', 'PropertiesService', 'LockService', 'Utilities', 'UrlFetchApp', body)(
-    ...names.map(n => stubs[n]), {}, { MimeType: { JSON: 1 }, createTextOutput: s => ({ s, setMimeType() { return this; } }) },
+  return new Function(...names, 'SpreadsheetApp', 'Session', 'ContentService', 'PropertiesService', 'LockService', 'Utilities', 'UrlFetchApp', body)(
+    ...names.map(n => stubs[n]), sheetsApp, { getScriptTimeZone: () => 'UTC' }, { MimeType: { JSON: 1 }, createTextOutput: s => ({ s, setMimeType() { return this; } }) },
     { getScriptProperties: () => ({ getProperty: k => ({ SECRET: 's', BRICKSET_KEY: 'k' })[k] || null, setProperties() {} }) },
     { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) }, { formatDate: () => '2026-01-01' }, fetchStub);
 }
@@ -208,6 +208,77 @@ async function main() {
     await until(() => t.ev('scans.length') === 1 && t.ev('scans[0].name') === 'Variant Name');
     eq('app: found variant gets its own name and number', t.ev('[scans[0].setNumber, scans[0].name]'), ['75192-2', 'Variant Name']);
     t.done();
+  }
+
+  head('4. Inventory data check');
+  {
+    const g = gas();
+    const now = new Date('2026-11-27T12:00:00Z');
+    const PH = ['Item', 'Category', 'Set #', 'Qty', 'Condition', 'Bought For', 'Purchase Date', 'Location', 'Notes', 'Value of One', 'Estimated Current Value', 'Value Source', 'Value Updated'];
+    const SH = ['Set #', 'Set Name', 'Theme', 'Qty', 'Condition', 'Bought For', 'Purchase Date', 'Est. Sale Price', 'Value Source', 'Value Updated'];
+    const fresh = new Date('2026-11-20T00:00:00Z');
+    const pr = (o = {}) => { const d = { Item: 'Item', 'Set #': '10000', Qty: '1', Condition: 'Sealed', 'Bought For': '50', 'Purchase Date': '2024-01-01', Location: 'Shelf', 'Value of One': '100', 'Estimated Current Value': '100', 'Value Updated': fresh, ...o }; return PH.map(h => d[h] ?? ''); };
+    const sr = (o = {}) => { const d = { 'Set #': '20000', 'Set Name': 'Sale thing', Qty: '1', Condition: 'New', 'Est. Sale Price': '50', 'Value Updated': fresh, ...o }; return SH.map(h => d[h] ?? ''); };
+    const prows = [
+      pr({ Item: 'Millennium Falcon', 'Set #': '75192' }),                                  // 2 ok (duplicated at row 6)
+      pr({ Item: 'Mystery', 'Set #': '' }),                                                 // 3 missing set number
+      pr({ Item: '', 'Set #': '10300' }),                                                   // 4 missing name
+      pr({ Item: 'Bad', 'Set #': 'ABC12' }),                                                // 5 wrong format
+      pr({ Item: 'Millennium Falcon', 'Set #': '75192' }),                                  // 6 duplicate of row 2
+      pr({ Item: 'Tie Fighter', 'Set #': '75300', 'Value Updated': new Date('2026-09-01T00:00:00Z') }), // 7 stale + also in Sale
+      pr({ Item: 'Old Name', 'Set #': '10294', 'Value of One': '' }),                       // 8 not the cache name + blank value
+      pr({ Item: 'Home Alone', 'Set #': '21330', 'Value Updated': '' }),                    // 9 value but no Value Updated
+      pr({ Item: '', 'Set #': '', Qty: '', Condition: '', 'Estimated Current Value': '$0' }), // 10 empty row with a formula value: ignored
+      pr({ Item: 'Variant', 'Set #': '75192-2' }),                                          // 11 different variant: not a duplicate
+    ];
+    const srows = [sr({ 'Set #': '75300', 'Set Name': 'Tie Fighter' }), sr({ 'Set #': '30000-1', 'Set Name': 'Other' })];
+    const cache = [['111', '75192', 'Millennium Falcon'], ['222', '75300', 'tie  fighter'], ['333', '10294', 'Titanic'], ['444', '99999', '']];
+    const mk = (tab, nameHdr, valueHdr, head, rows) => ({ tab, nameHdr, valueHdr, found: true, head, display: rows.map(r => r.map(v => v instanceof Date ? v.toISOString().slice(0, 10) : String(v))), raw: rows });
+    const run = () => g.analyzeInventory([mk('Personal Inventory', 'Item', 'Value of One', PH, prows), mk('Sale Inventory', 'Set Name', 'Est. Sale Price', SH, srows)], cache, now);
+    const a = run();
+    const rowsOf = t => a.issues.filter(i => i.type === t).map(i => i.tab[0] + i.row);
+    eq('missing set number or name', rowsOf('missing'), ['P3', 'P4']);
+    eq('wrong format', rowsOf('format'), ['P5']);
+    eq('same set in both tabs (both sides listed)', rowsOf('both'), ['P7', 'S2']);
+    eq('duplicate rows (variant -2 is not a duplicate)', rowsOf('dupe'), ['P2', 'P6']);
+    eq('name differs from Lookup Cache (case/space-insensitive match is fine)', rowsOf('cache'), ['P8']);
+    eq('blank value', rowsOf('blank'), ['P8']);
+    eq('value older than 30 days', rowsOf('stale'), ['P7']);
+    eq('value but no Value Updated', rowsOf('nodate'), ['P9']);
+    eq('counts per issue', a.counts, { missing: 2, format: 1, both: 2, dupe: 2, cache: 1, blank: 1, stale: 1, nodate: 1 });
+    eq('empty/formula-only rows are not counted as data', a.checked['Personal Inventory'], 9);
+    check('stale detail says how old', /2026-09-01 \(87 days ago\)/.test(a.issues.find(i => i.type === 'stale').detail), a.issues.find(i => i.type === 'stale'));
+    // the analysis never touches its input
+    const before = JSON.stringify(prows);
+    run();
+    eq('input rows are not modified', JSON.stringify(prows), before);
+    const a2 = g.analyzeInventory([{ tab: 'Personal Inventory', nameHdr: 'Item', valueHdr: 'Value of One', found: false }, { tab: 'Sale Inventory', nameHdr: 'Set Name', valueHdr: 'Est. Sale Price', found: false }], null, now);
+    check('missing tabs and cache are reported as notes, not errors', a2.notes.length === 3 && a2.issues.length === 0, a2.notes);
+  }
+
+  {
+    // The menu function against a fake spreadsheet: it may read the inventory tabs but must write only the Data Check tab.
+    const writes = [], alerts = [];
+    let dcRows = null;
+    const chain = (name, getVals) => { // a range that answers reads and records any other call as a write
+      const base = { getValues: getVals, getDisplayValues: () => getVals().map(r => r.map(String)) };
+      const px = new Proxy(base, { get: (t, k) => k in t ? t[k] : (...a) => { writes.push(name + '.' + String(k)); if (k === 'setValues' && name === 'Data Check') dcRows = a[0]; return px; } });
+      return px;
+    };
+    const input = (name, data) => ({ getLastRow: () => data.length, getLastColumn: () => data[0].length,
+      getRange: (r, c, nr = 1, nc = 1) => chain(name, () => data.slice(r - 1, r - 1 + nr).map(row => row.slice(c - 1, c - 1 + nc))) });
+    const sheets = {
+      'Personal Inventory': input('Personal Inventory', [['Item', 'Set #', 'Qty', 'Condition', 'Value of One', 'Value Updated'], ['Falcon', '75192', '1', 'Sealed', '', ''], ['', '', '', '', '', '']]),
+      'Sale Inventory': input('Sale Inventory', [['Set #', 'Set Name', 'Qty', 'Condition', 'Est. Sale Price', 'Value Updated'], ['75192', 'Falcon', '1', 'New', '5', '']]),
+      'Lookup Cache': input('Lookup Cache', [['Barcode', 'Set #', 'Set Name'], ['1', '75192', 'Falcon']]),
+    };
+    const dc = new Proxy({}, { get: (t, k) => k === 'getRange' ? (() => chain('Data Check', () => [[]])) : (...a) => { writes.push('Data Check.' + String(k)); } });
+    const ss = { getSheetByName: n => sheets[n] || null, insertSheet: n => { writes.push('insertSheet ' + n); return dc; }, setActiveSheet() {} };
+    const g = gas(undefined, { getUi: () => ({ alert: (t, m) => alerts.push(String(m || t)), ButtonSet: { OK: 1 } }), getActiveSpreadsheet: () => ss });
+    g.checkInventoryData();
+    check('menu run writes only to the Data Check tab', writes.length > 0 && writes.every(w => w === 'insertSheet Data Check' || w.startsWith('Data Check.')), writes);
+    check('Data Check tab gets a per-issue count and the row numbers', dcRows && dcRows.some(r => r[0] === 'Issue' && r[1] === 'Count') && dcRows.some(r => r[1] === 'Personal Inventory' && r[2] === 2), dcRows);
+    check('alert summarises the counts', alerts.length === 1 && /Same set in both/.test(alerts[0]), alerts);
   }
 
   // @@MORE@@

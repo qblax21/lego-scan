@@ -84,7 +84,7 @@ async function api(action, payload) {
 // APP_VERSION matches the service worker cache number (lego-scan-vN). EXPECTED_SCRIPT is the lowest SCRIPT_VERSION in
 // Code.gs this app can work with; bump it together with SCRIPT_VERSION whenever the script's API or behaviour changes.
 const APP_VERSION = 15;
-const EXPECTED_SCRIPT = 2;
+const EXPECTED_SCRIPT = 3;
 const SCRIPT_OLD_MSG = 'Sheet script is out of date. In the script editor: Deploy > Manage deployments > New version.';
 let scriptInfo = { state: 'unchecked', version: null, at: 0, tried: 0 }; // state: unchecked | ok | old | missing | unknown
 async function checkScript(force) {
